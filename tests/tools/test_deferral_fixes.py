@@ -452,10 +452,22 @@ class TestCheckFnFlipBustsToolDefsMemo:
         try:
             model_tools._clear_tool_defs_cache()
             invalidate_check_fn_cache()
+            # Warm-up: the first rebuild can lazily register tools, which
+            # flips the verdict snapshot mid-build and makes the TOCTOU
+            # guard skip the store. The second call stores deterministically.
+            _tool_search_scoped_names(agent)
             assert tool_name not in _tool_search_scoped_names(agent)
+            cache_before = agent._tool_search_scope_cache
+            assert cache_before is not None
 
             config_path.write_text("enabled", encoding="utf-8")
             assert tool_name in _tool_search_scoped_names(agent)
+            # The config fingerprint is part of the cache key: a config write
+            # must re-key the scope cache, never serve the pre-write entry.
+            # Asserting the key change keeps this test red on a key that
+            # omits the fingerprint even when an unrelated cache miss makes
+            # the membership assert above pass by recomputation.
+            assert agent._tool_search_scope_cache[0] != cache_before[0]
         finally:
             registry.deregister(tool_name)
             _NO_CACHE_CHECK_FNS.discard(_config_check)

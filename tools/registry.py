@@ -545,7 +545,7 @@ class ToolRegistry:
         """
         registry_scope = scope or self.current_scope_key()
         probe_scope = check_fn_cache_scope()
-        cache_key = (self, registry_scope, probe_scope)
+        cache_key = (self, registry_scope, probe_scope, self._generation)
         now = time.monotonic()
         snapshot_epoch = -1
         if probe_scope != CHECK_FN_CACHE_BYPASS:
