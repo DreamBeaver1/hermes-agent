@@ -7899,6 +7899,7 @@ def _validate_kanban_worktree(task: Task, workspace: Path, branch_name: str) -> 
         expected_branch=branch_name,
         expected_remote=remote.stdout.strip(),
         expected_origin_main=origin_main.stdout.strip(),
+        require_clean=True,
     )
 
 
@@ -7909,6 +7910,22 @@ def _prepare_kanban_worktree(task: Task, workspace: Path, branch_name: str) -> N
     no untracked marker is written into an otherwise clean checkout.
     """
     _validate_kanban_worktree(task, workspace, branch_name)
+
+
+def _assert_task_workspace_owner(
+    conn: sqlite3.Connection, task: Task, workspace: Path
+) -> None:
+    """Reject a checkout already persisted as another active task's workspace."""
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE workspace_path = ? AND id <> ? "
+        "AND status NOT IN ('done', 'archived') LIMIT 1",
+        (str(workspace), task.id),
+    ).fetchone()
+    if row is not None:
+        raise ValueError(
+            f"preflight workspace ownership collision: {workspace} "
+            f"is already owned by task {row['id']}"
+        )
 
 
 def _invoke_spawn(spawn_fn, task: Task, workspace: str, board=None):
@@ -10349,6 +10366,14 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
+        try:
+            _assert_task_workspace_owner(conn, claimed, Path(workspace).resolve(strict=False))
+        except Exception as exc:
+            with write_txn(conn):
+                _end_run(conn, claimed.id, outcome="infrastructure_failed", status="failed", error=f"preflight: {exc}")
+                conn.execute("UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (claimed.id,))
+                _append_event(conn, claimed.id, "infrastructure_failed", {"error": f"preflight: {exc}", "retryable": False})
+            continue
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
@@ -10505,6 +10530,14 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
+        try:
+            _assert_task_workspace_owner(conn, claimed, Path(workspace).resolve(strict=False))
+        except Exception as exc:
+            with write_txn(conn):
+                _end_run(conn, claimed.id, outcome="infrastructure_failed", status="failed", error=f"preflight: {exc}")
+                conn.execute("UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (claimed.id,))
+                _append_event(conn, claimed.id, "infrastructure_failed", {"error": f"preflight: {exc}", "retryable": False})
+            continue
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
