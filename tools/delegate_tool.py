@@ -2751,6 +2751,37 @@ def _run_single_child(
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
         )
 
+        # Validate task-owned repository state before the executor can make a
+        # model call. Infrastructure failures are preserved as exact evidence
+        # and are not child/model failures or retryable repair attempts.
+        if _worktree_info is not None:
+            try:
+                from agent.reliability import repository_preflight
+
+                repository_preflight(
+                    _worktree_info["path"],
+                    repository=_worktree_info["repo_root"],
+                    base_revision=_worktree_info["base_commit"],
+                    expected_branch=_worktree_info["branch"],
+                )
+            except Exception as _preflight_exc:
+                from agent.reliability import PreflightError, preflight_failure_result
+
+                if not isinstance(_preflight_exc, PreflightError):
+                    _preflight_exc = PreflightError(
+                        f"preflight raised {type(_preflight_exc).__name__}: {_preflight_exc}"
+                    )
+                _error_entry = {
+                    "task_index": task_index,
+                    **preflight_failure_result(_preflight_exc),
+                    "summary": None,
+                    "exit_reason": "infrastructure_preflight",
+                    "duration_seconds": round(time.monotonic() - child_start, 2),
+                    "_child_role": getattr(child, "_delegate_role", None),
+                }
+                _attach_worktree(_error_entry)
+                return _error_entry
+
         # Run child with an optional hard timeout (off by default —
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
@@ -2786,13 +2817,21 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from contextlib import nullcontext
+            from agent.reliability import repository_implementation_lock
 
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
+                lock_context = (
+                    repository_implementation_lock(_worktree_info["repo_root"])
+                    if _worktree_info is not None
+                    else nullcontext()
                 )
+                with lock_context:
+                    return child.run_conversation(
+                        user_message=goal,
+                        task_id=child_task_id,
+                        stream_callback=_relay_child_text,
+                    )
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
