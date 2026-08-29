@@ -7737,6 +7737,22 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         target_common = _git_common_dir(target)
         if target_common == repo_common:
             return
+    metadata = subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    if metadata.returncode == 0:
+        blocks = metadata.stdout.split("\n\n")
+        if any(
+            f"branch refs/heads/{branch_name}\n" in block
+            and not block.startswith(f"worktree {target}\n")
+            for block in blocks
+        ):
+            raise ValueError(
+                f"git branch collision: {branch_name} is already checked out "
+                "by another worktree"
+            )
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
@@ -7846,6 +7862,75 @@ def _resolve_worktree_workspace(
         )
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
+
+
+def _validate_kanban_worktree(task: Task, workspace: Path, branch_name: str) -> None:
+    """Run the non-mutating reliability gate before a Kanban worker starts."""
+    from agent.reliability import repository_preflight
+
+    repo_root = _git_toplevel(workspace)
+    if repo_root is None:
+        raise ValueError(f"preflight repository missing for task {task.id}: {workspace}")
+    remote = subprocess.run(
+        ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    if remote.returncode != 0 or not remote.stdout.strip():
+        raise ValueError(f"preflight origin missing for repository {repo_root}")
+    origin_main = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "origin/main"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    if origin_main.returncode != 0:
+        raise ValueError(f"preflight origin/main missing for repository {repo_root}")
+    base = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    if base.returncode != 0:
+        raise ValueError(f"preflight base revision missing for repository {repo_root}")
+    repository_preflight(
+        workspace,
+        repository=repo_root,
+        base_revision=base.stdout.strip(),
+        expected_branch=branch_name,
+        expected_remote=remote.stdout.strip(),
+        expected_origin_main=origin_main.stdout.strip(),
+    )
+
+
+def _prepare_kanban_worktree(task: Task, workspace: Path, branch_name: str) -> None:
+    """Validate a task-owned worktree before worker launch.
+
+    Ownership is persisted in the task row (workspace_path + branch_name), so
+    no untracked marker is written into an otherwise clean checkout.
+    """
+    _validate_kanban_worktree(task, workspace, branch_name)
+
+
+def _invoke_spawn(spawn_fn, task: Task, workspace: str, board=None):
+    """Invoke a spawn callback under the repository implementation lock."""
+    import inspect
+
+    def call():
+        try:
+            sig = inspect.signature(spawn_fn)
+            if "board" in sig.parameters:
+                return spawn_fn(task, workspace, board=board)
+        except (TypeError, ValueError):
+            pass
+        return spawn_fn(task, workspace)
+
+    repo = _git_toplevel(Path(workspace))
+    if repo is None or task.workspace_kind != "worktree":
+        return call()
+    from agent.reliability import repository_implementation_lock
+
+    with repository_implementation_lock(repo, blocking=False):
+        return call()
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
@@ -10268,20 +10353,34 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if claimed.workspace_kind == "worktree":
+            try:
+                _prepare_kanban_worktree(
+                    claimed, Path(workspace),
+                    resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
+                )
+            except Exception as exc:
+                with write_txn(conn):
+                    _end_run(
+                        conn, claimed.id, outcome="infrastructure_failed",
+                        status="failed", error=f"preflight: {exc}",
+                    )
+                    conn.execute(
+                        "UPDATE tasks SET status='blocked', claim_lock=NULL, "
+                        "claim_expires=NULL, current_run_id=NULL WHERE id=?",
+                        (claimed.id,),
+                    )
+                    _append_event(
+                        conn, claimed.id, "infrastructure_failed",
+                        {"error": f"preflight: {exc}", "retryable": False},
+                    )
+                continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            pid = _invoke_spawn(_spawn, claimed, str(workspace), board=board)
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
@@ -10308,6 +10407,21 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            from agent.reliability import LockContention
+            if isinstance(exc, LockContention):
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                        "claim_expires=NULL WHERE id=?",
+                        (claimed.id,),
+                    )
+                    _end_run(
+                        conn, claimed.id, outcome="queued", status="requeued",
+                        error="repository implementation lock contention",
+                    )
+                    _append_event(conn, claimed.id, "implementation_queued", {"lock": str(exc)})
+                result.respawn_guarded.append((claimed.id, "repository_lock"))
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -10405,15 +10519,7 @@ def _dispatch_once_locked(
         )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            pid = _invoke_spawn(_spawn, claimed, str(workspace), board=board)
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): same contract as the

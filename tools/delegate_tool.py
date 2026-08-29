@@ -2763,6 +2763,8 @@ def _run_single_child(
                     repository=_worktree_info["repo_root"],
                     base_revision=_worktree_info["base_commit"],
                     expected_branch=_worktree_info["branch"],
+                    expected_remote=_worktree_info.get("remote"),
+                    expected_task_id=_worktree_info.get("task_id"),
                 )
             except Exception as _preflight_exc:
                 from agent.reliability import PreflightError, preflight_failure_result

@@ -33,6 +33,10 @@ class PreflightError(RuntimeError):
         self.evidence = evidence
 
 
+class LockContention(RuntimeError):
+    """The repository is currently owned by another implementation worker."""
+
+
 def _git(workspace: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(workspace), *args],
@@ -57,6 +61,10 @@ def repository_preflight(
     repository: str | Path | None = None,
     base_revision: str,
     expected_branch: str | None = None,
+    expected_remote: str | None = None,
+    expected_task_id: str | None = None,
+    expected_origin_main: str | None = None,
+    require_clean: bool = False,
 ) -> PreflightEvidence:
     """Validate the canonical repository and task-owned checkout.
 
@@ -70,6 +78,27 @@ def repository_preflight(
     if not base_revision or not base_revision.strip():
         raise PreflightError("preflight base revision missing")
     actual_repo = Path(_git(ws, "rev-parse", "--show-toplevel")).resolve()
+    if not actual_repo.is_dir() or not (actual_repo / ".git").exists():
+        raise PreflightError(f"preflight repository invalid: {actual_repo}")
+    if expected_remote is not None:
+        remote = _git(ws, "remote", "get-url", "origin")
+        if remote != expected_remote:
+            raise PreflightError(f"preflight origin mismatch: expected {expected_remote}, got {remote}")
+    if expected_origin_main is not None:
+        origin_main = _git(ws, "rev-parse", "origin/main")
+        if origin_main != expected_origin_main:
+            raise PreflightError(
+                f"preflight origin/main mismatch: expected {expected_origin_main}, got {origin_main}"
+            )
+    if expected_task_id is not None:
+        marker = ws / ".hermes-task-id"
+        if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != expected_task_id:
+            raise PreflightError(f"preflight task ownership mismatch: expected {expected_task_id} at {marker}")
+    worktrees = _git(actual_repo, "worktree", "list", "--porcelain")
+    entries = worktrees.split("\n\n")
+    matches = [e for e in entries if f"worktree {ws}" in e]
+    if len(matches) != 1:
+        raise PreflightError(f"preflight worktree metadata mismatch: {ws}")
     canonical_repo = (
         Path(repository).expanduser().resolve(strict=False)
         if repository is not None
@@ -94,12 +123,16 @@ def repository_preflight(
         raise PreflightError(
             f"preflight branch mismatch: expected {expected_branch}, got {branch or '<detached>'}"
         )
+    if require_clean:
+        dirty = _git(ws, "status", "--porcelain")
+        if dirty:
+            raise PreflightError(f"preflight workspace not clean: {dirty}")
     return PreflightEvidence(str(ws), str(canonical_repo), base_revision, head, branch)
 
 
 @contextlib.contextmanager
 def repository_implementation_lock(
-    repository: str | Path, *, read_only: bool = False
+    repository: str | Path, *, read_only: bool = False, blocking: bool = True
 ) -> Iterator[None]:
     """Serialize implementation work per repository; read-only work bypasses it.
 
@@ -118,7 +151,12 @@ def repository_implementation_lock(
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
         else:
             import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+            try:
+                fcntl.flock(handle.fileno(), flags)
+            except BlockingIOError:
+                handle.close()
+                raise LockContention(str(lock_path))
         yield
     finally:
         try:
