@@ -191,4 +191,42 @@ def test_collision_is_blocked_and_not_retried(kanban_home, monkeypatch):
     assert not first.spawned and not second.spawned
 
 
+def test_workspace_owner_metadata_blocks_active_reuse(kanban_home, tmp_path):
+    workspace = (tmp_path / "repo" / ".worktrees" / "owner").resolve()
+    with kb.connect() as conn:
+        owner_id = kb.create_task(
+            conn, title="owner", workspace_kind="worktree",
+            workspace_path=str(workspace), branch_name="wt/owner",
+        )
+        contender_id = kb.create_task(
+            conn, title="contender", workspace_kind="worktree",
+            workspace_path=str(workspace), branch_name="wt/contender",
+        )
+        contender = kb.get_task(conn, contender_id)
+        assert contender is not None
+        with pytest.raises(ValueError, match=f"owned by task {owner_id}"):
+            kb._assert_task_workspace_owner(conn, contender, workspace)
+
+
+def test_collision_evidence_is_idempotent(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="collision")
+        kb._record_workspace_collision(conn, tid, "first collision")
+        kb._record_workspace_collision(conn, tid, "second collision")
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='infrastructure_failed' ORDER BY id",
+            (tid,),
+        ).fetchall()
+        task = conn.execute(
+            "SELECT status, last_failure_error FROM tasks WHERE id=?", (tid,)
+        ).fetchone()
+
+    assert len(events) == 1
+    assert events[0]["payload"] is not None
+    assert "first collision" in events[0]["payload"]
+    assert task["status"] == "blocked"
+    assert task["last_failure_error"] == "first collision"
+
+
 

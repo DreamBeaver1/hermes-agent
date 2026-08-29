@@ -9528,8 +9528,38 @@ def _record_spawn_failure(
 
 
 def _record_workspace_collision(conn: sqlite3.Connection, task_id: str, error: str) -> None:
-    """Block an unsafe pre-existing workspace without consuming retries."""
+    """Block an unsafe pre-existing workspace without consuming retries.
+
+    Collision handling can be reached by more than one dispatcher observing a
+    claimed task during recovery.  Keep the durable evidence idempotent: once
+    a collision event exists, preserve the first diagnostic and do not append
+    another event or rewrite the task's failure metadata.
+    """
     with write_txn(conn):
+        prior = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'infrastructure_failed' "
+            "ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+        for row in prior:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if payload.get("collision") is True:
+                first_error = str(payload.get("error") or error)
+                _end_run(
+                    conn, task_id, outcome="infrastructure_failed",
+                    status="failed", error=first_error,
+                )
+                conn.execute(
+                    "UPDATE tasks SET status='blocked', claim_lock=NULL, "
+                    "claim_expires=NULL, current_run_id=NULL, "
+                    "last_failure_error=? WHERE id=?",
+                    (first_error[:500], task_id),
+                )
+                return
         _end_run(conn, task_id, outcome="infrastructure_failed", status="failed", error=error)
         conn.execute(
             "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
