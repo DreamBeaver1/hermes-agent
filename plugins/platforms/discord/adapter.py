@@ -7232,7 +7232,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
         for attempt in range(2):
             try:
-                thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
+                # Keep the conversation available for the full Discord maximum
+                # so an idle Hermes session can rotate without deleting or
+                # closing the user-facing thread.
+                thread = await message.create_thread(name=thread_name, auto_archive_duration=10080)
                 try:
                     setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
                 except Exception:
@@ -7246,7 +7249,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
                     thread = await seed_msg.create_thread(
                         name=thread_name,
-                        auto_archive_duration=1440,
+                        auto_archive_duration=10080,
                         reason=reason,
                     )
                     try:
@@ -7381,7 +7384,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if create is not None:
                 thread = await create(
                     name=thread_name,
-                    auto_archive_duration=1440,
+                    auto_archive_duration=10080,
                     reason=reason,
                 )
                 return str(thread.id)
@@ -7399,7 +7402,7 @@ class DiscordAdapter(BasePlatformAdapter):
             seed_msg = await send(f"\U0001f9f5 Hermes handoff: **{thread_name}**")
             thread = await seed_msg.create_thread(
                 name=thread_name,
-                auto_archive_duration=1440,
+                auto_archive_duration=10080,
                 reason=reason,
             )
             return str(thread.id)
@@ -8162,7 +8165,12 @@ class DiscordAdapter(BasePlatformAdapter):
             skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
+            # Slash commands are control-plane operations.  Keep them inline so
+            # /status, /help, /new, etc. do not create a conversation thread.
+            # ``normalized_content`` is used because mention stripping above
+            # may have changed ``message.content``.
+            is_slash_command = normalized_content.startswith("/")
+            if auto_thread and not is_slash_command and not skip_thread and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)

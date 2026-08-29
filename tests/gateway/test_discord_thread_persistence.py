@@ -6,7 +6,10 @@ being persisted to ~/.hermes/discord_threads.json.
 
 import json
 import os
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 
 class TestDiscordThreadPersistence:
@@ -46,5 +49,20 @@ class TestDiscordThreadPersistence:
         adapter2 = self._make_adapter(tmp_path)
         assert "aaa" in adapter2._threads
         assert "bbb" in adapter2._threads
+
+    @pytest.mark.asyncio
+    async def test_auto_threads_use_seven_day_archive_window(self, tmp_path):
+        """Auto-created conversation threads stay reopenable for seven days."""
+        adapter = self._make_adapter(tmp_path)
+        message = SimpleNamespace(
+            content="Discuss the project",
+            author=SimpleNamespace(display_name="TestUser"),
+            create_thread=AsyncMock(return_value=SimpleNamespace(id="thread-1")),
+        )
+
+        result = await adapter._auto_create_thread(message)
+
+        assert result.id == "thread-1"
+        assert message.create_thread.await_args.kwargs["auto_archive_duration"] == 10080
 
 
