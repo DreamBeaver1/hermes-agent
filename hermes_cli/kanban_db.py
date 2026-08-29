@@ -7729,25 +7729,89 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+class _WorkspaceCollision(ValueError):
+    """A pre-existing workspace is unsafe to mutate or reuse."""
+
+
+def _worktree_metadata(output: str) -> list[dict[str, str]]:
+    blocks: list[dict[str, str]] = []
+    for raw in output.split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in raw.splitlines():
+            key, sep, value = line.partition(" ")
+            if sep:
+                fields[key] = value
+        if fields:
+            blocks.append(fields)
+    return blocks
+
+
+def _ensure_git_worktree(
+    repo_root: Path, target: Path, branch_name: str, *, owner_id: str | None = None
+) -> None:
+    """Create or safely reuse a task-owned linked worktree.
+
+    Existing paths are inspected before any mutating git command.  A path with
+    a .git entry is never passed to ``git worktree add``: it is either an exact,
+    registered, clean, correctly-owned checkout or a preserved collision.
+    """
     target = target.expanduser()
+    target_resolved = target.resolve(strict=False)
     repo_common = _git_common_dir(repo_root)
-    if target.exists() and repo_common is not None:
-        target_common = _git_common_dir(target)
-        if target_common == repo_common:
-            return
     metadata = subprocess.run(
         ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=30, check=False,
     )
-    if metadata.returncode == 0:
-        blocks = metadata.stdout.split("\n\n")
-        if any(
-            f"branch refs/heads/{branch_name}\n" in block
-            and not block.startswith(f"worktree {target}\n")
-            for block in blocks
+    if metadata.returncode != 0:
+        detail = (metadata.stderr or metadata.stdout or "").strip()
+        raise RuntimeError(
+            f"git worktree metadata failed for {repo_root}: {detail}"
+        )
+    blocks = _worktree_metadata(metadata.stdout)
+    target_entry = next(
+        (fields for fields in blocks
+         if Path(fields.get("worktree", "")).resolve(strict=False) == target_resolved),
+        None,
+    )
+    target_has_git = (target / ".git").exists()
+    if target.exists():
+        # Never invoke worktree creation against an existing git checkout,
+        # including partial/unregistered checkouts and ordinary repositories.
+        if target_has_git:
+            target_common = _git_common_dir(target)
+            actual_branch = _git_current_branch(target)
+            status = subprocess.run(
+                ["git", "-C", str(target), "status", "--porcelain"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=30, check=False,
+            )
+            dirty = (status.stdout or "").strip() if status.returncode == 0 else "git-status-failed"
+            # Task ownership is authoritative in the Kanban task row and is
+            # checked by _assert_task_workspace_owner before this function.
+            # Do not create a marker: it would make an otherwise clean
+            # worktree dirty under the reliability preflight.
+            if (target_entry is not None and target_common == repo_common
+                    and actual_branch == branch_name and not dirty):
+                return
+            raise _WorkspaceCollision(
+                f"workspace collision: {target} exists; registered={target_entry is not None}, "
+                f"repository_match={target_common == repo_common}, branch={actual_branch!r}, "
+                f"expected_branch={branch_name!r}, owner=kanban-task-row, expected_owner={owner_id!r}, "
+                f"dirty={bool(dirty)}"
+            )
+        try:
+            has_entries = any(target.iterdir())
+        except OSError:
+            has_entries = True
+        if has_entries:
+            raise _WorkspaceCollision(
+                f"workspace collision: {target} exists without registered git worktree (.git absent)"
+            )
+    for fields in blocks:
+        if (
+            fields.get("branch") == f"refs/heads/{branch_name}"
+            and Path(fields.get("worktree", "")).resolve(strict=False) != target_resolved
         ):
             raise ValueError(
                 f"git branch collision: {branch_name} is already checked out "
@@ -7815,7 +7879,7 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, owner_id=task.id)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -7827,31 +7891,30 @@ def _resolve_worktree_workspace(
     requested_resolved = requested.resolve(strict=False)
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
-        actual_branch = _git_current_branch(requested)
-        if actual_branch == branch_name:
-            return requested_resolved, actual_branch
-        # The requested path is an existing checkout of a DIFFERENT
-        # task's branch. Decompose children inherit the root's
-        # workspace_path verbatim, so siblings all point here; reusing
-        # the checkout as-is would run this task on the other task's
-        # branch — silent cross-task provenance corruption, and unsafe
-        # when siblings run concurrently. Fall back to a fresh worktree
-        # of our own under the same repo.
         fallback_root = _repo_root_for_worktree_target(requested.parent)
+        if fallback_root is not None and _git_current_branch(requested) == branch_name:
+            _ensure_git_worktree(
+                fallback_root, requested, branch_name, owner_id=task.id
+            )
+            return requested_resolved, branch_name
+        # A different branch is an occupied path; preserve it and materialize
+        # this task below the canonical repository instead.
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(
+                    fallback_root, fallback, branch_name, owner_id=task.id
+                )
                 return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this
-        # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
-        return requested_resolved, actual_branch or branch_name
+        raise _WorkspaceCollision(
+            f"workspace collision: {requested} is a registered worktree on "
+            f"branch {_git_current_branch(requested)!r}, expected {branch_name!r}"
+        )
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, owner_id=task.id)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -7860,7 +7923,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(repo_root, requested, branch_name, owner_id=task.id)
     return requested, branch_name
 
 
@@ -9464,6 +9527,21 @@ def _record_spawn_failure(
     )
 
 
+def _record_workspace_collision(conn: sqlite3.Connection, task_id: str, error: str) -> None:
+    """Block an unsafe pre-existing workspace without consuming retries."""
+    with write_txn(conn):
+        _end_run(conn, task_id, outcome="infrastructure_failed", status="failed", error=error)
+        conn.execute(
+            "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
+            "current_run_id=NULL, last_failure_error=? WHERE id=?",
+            (error[:500], task_id),
+        )
+        _append_event(
+            conn, task_id, "infrastructure_failed",
+            {"error": error, "retryable": False, "collision": True},
+        )
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -10357,6 +10435,9 @@ def _dispatch_once_locked(
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
+        except _WorkspaceCollision as exc:
+            _record_workspace_collision(conn, claimed.id, str(exc))
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -10521,6 +10602,9 @@ def _dispatch_once_locked(
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
+        except _WorkspaceCollision as exc:
+            _record_workspace_collision(conn, claimed.id, str(exc))
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",

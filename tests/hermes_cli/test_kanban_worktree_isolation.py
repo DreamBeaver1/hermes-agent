@@ -126,5 +126,69 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
     assert head == "wt/sibling"
 
 
+def test_correctly_owned_clean_worktree_is_reused(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "owned"
+    _add_worktree(repo, target, "wt/owned")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="owned", workspace_kind="worktree", workspace_path=str(target), branch_name="wt/owned")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+    workspace, branch = kb._resolve_worktree_workspace(task)
+    assert workspace == target.resolve()
+    assert branch == "wt/owned"
+
+
+def test_dirty_worktree_is_preserved_collision(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    target = _add_worktree(repo, repo / ".worktrees" / "dirty", "wt/dirty")
+    (target / "untracked.txt").write_text("keep me\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="workspace collision"):
+        kb._ensure_git_worktree(repo, target, "wt/dirty", owner_id="dirty")
+    assert (target / "untracked.txt").read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_partial_unregistered_git_path_is_collision_without_add(kanban_home, tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "partial"
+    target.mkdir(parents=True)
+    (target / ".git").write_text("gitdir: nowhere\n", encoding="utf-8")
+    calls = []
+    real_run = subprocess.run
+    def run(*args, **kwargs):
+        if args and isinstance(args[0], list) and args[0][0:4] == ["git", "-C", str(repo), "worktree"] and "add" in args[0]:
+            calls.append(args[0])
+        return real_run(*args, **kwargs)
+    monkeypatch.setattr(kb.subprocess, "run", run)
+    with pytest.raises(ValueError, match="workspace collision"):
+        kb._ensure_git_worktree(repo, target, "wt/partial", owner_id="partial")
+    assert calls == []
+
+
+def test_collision_is_blocked_and_not_retried(kanban_home, monkeypatch):
+    spawns = []
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="collision", assignee="alice", workspace_kind="worktree")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        monkeypatch.setattr(
+            kb, "_resolve_worktree_workspace",
+            lambda task, board=None: (_ for _ in ()).throw(
+                kb._WorkspaceCollision("workspace collision: unchanged")
+            ),
+        )
+        first = kb._dispatch_once_locked(
+            conn, spawn_fn=lambda *args, **kwargs: spawns.append(args), max_spawn=1,
+        )
+        second = kb._dispatch_once_locked(
+            conn, spawn_fn=lambda *args, **kwargs: spawns.append(args), max_spawn=1,
+        )
+        row = conn.execute("SELECT status, consecutive_failures FROM tasks WHERE id=?", (tid,)).fetchone()
+    assert row["status"] == "blocked"
+    assert row["consecutive_failures"] == 0
+    assert not spawns
+    assert not first.spawned and not second.spawned
+
 
 
