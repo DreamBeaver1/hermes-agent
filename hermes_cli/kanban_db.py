@@ -91,6 +91,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
+from hermes_cli.task_contract import contract_from_task, validate_contract
 
 _log = logging.getLogger(__name__)
 
@@ -1049,6 +1050,15 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # Data classes
 # ---------------------------------------------------------------------------
 
+def _decode_task_contract(value: Any) -> Optional[dict]:
+    """Decode stored contracts without allowing malformed JSON to crash a tick."""
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 @dataclass
 class Task:
     """In-memory view of a row from the ``tasks`` table."""
@@ -1144,6 +1154,8 @@ class Task:
     # Nullable task policy. Legacy NULL rows resolve to Forge's default only
     # at the publication gate; the stored value is never rewritten.
     publication_required: Optional[bool] = None
+    # Optional structured execution contract. None preserves legacy tasks.
+    task_contract: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1241,6 +1253,11 @@ class Task:
             publication_required=(
                 bool(row["publication_required"])
                 if "publication_required" in keys and row["publication_required"] is not None
+                else None
+            ),
+            task_contract=(
+                _decode_task_contract(row["task_contract"])
+                if "task_contract" in keys and row["task_contract"]
                 else None
             ),
         )
@@ -1432,7 +1449,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
     -- NULL preserves legacy semantics and is resolved by assignee at use time.
-    publication_required INTEGER DEFAULT NULL
+    publication_required INTEGER DEFAULT NULL,
+    task_contract        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2692,6 +2710,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "publication_required", "publication_required INTEGER DEFAULT NULL"
         )
+    if "task_contract" not in cols:
+        _add_column_if_missing(conn, "tasks", "task_contract", "task_contract TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3198,6 +3218,7 @@ def create_task(
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     publication_required: Optional[bool] = None,
+    task_contract: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3515,8 +3536,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, publication_required
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, publication_required,
+                        task_contract
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3543,6 +3565,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         None if publication_required is None else int(publication_required),
+                        json.dumps(dict(task_contract), sort_keys=True) if task_contract is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -8209,6 +8232,8 @@ class DispatchResult:
     dead/gone worker). See the reconciliation pass for details."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
+    contract_blocked: list[str] = field(default_factory=list)
+    """Task ids blocked by deterministic contract/prerequisite preflight."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -10386,6 +10411,26 @@ def _dispatch_once_locked(
                 result.auto_assigned_default.append(row["id"])
             else:
                 result.skipped_unassigned.append(row["id"])
+                continue
+        # Deterministic contract/prerequisite gate. This is deliberately before
+        # claim/workspace allocation/spawn: failures consume no retry budget.
+        full_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (row["id"],)).fetchone()
+        contract = contract_from_task(Task.from_row(full_row)) if full_row is not None else None
+        if contract is not None:
+            failure = validate_contract(contract, worker_env=os.environ)
+            if failure is not None:
+                evidence = failure.evidence
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status='blocked', block_kind='capability', "
+                        "claim_lock=NULL, claim_expires=NULL WHERE id=? AND status='ready'",
+                        (row["id"],),
+                    )
+                    _append_event(conn, row["id"], "contract_blocked", {
+                        "kind": failure.kind, "evidence": evidence,
+                        "retryable": False, "repair_consumed": False,
+                    })
+                result.contract_blocked.append(row["id"])
                 continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
