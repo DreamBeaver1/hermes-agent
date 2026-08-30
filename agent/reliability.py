@@ -142,7 +142,45 @@ def repository_implementation_lock(
     if read_only:
         yield
         return
-    lock_path = Path(repository).expanduser().resolve() / ".git" / "hermes-implementation.lock"
+    repository = Path(repository).expanduser().resolve()
+    # In a linked git worktree, ``<worktree>/.git`` is a FILE whose contents
+    # name the worktree's gitdir under the repository's common dir — not a
+    # directory.  ``mkdir(parents=True, exist_ok=True)`` on that path raises
+    # ``FileExistsError`` (Errno 17) and every worktree-scoped spawn fails.
+    # Resolve the common dir so the lock lives in one shared, real directory
+    # per repository (main checkout and all its worktrees contend on the
+    # same lock, which is the documented per-repository serialization
+    # contract).  Fall back to the literal ``.git`` path for bare/unusual
+    # layouts where resolution fails.
+    git_path = repository / ".git"
+    lock_dir: Optional[Path] = None
+    try:
+        # ``rev-parse --git-common-dir`` is authoritative for every layout:
+        # a normal checkout, a linked worktree (whose ``.git`` is a file
+        # naming ``<main>/.git/worktrees/<name>``, NOT a directory), and
+        # bare repos.  Resolving the common dir guarantees one shared, real
+        # lock directory per repository, so the main checkout and all its
+        # worktrees contend on the same lock file — the documented
+        # per-repository serialization contract.
+        result = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30, check=False,
+        )
+        if result.returncode == 0:
+            common = Path(result.stdout.strip())
+            if not common.is_absolute():
+                common = repository / common
+            common = common.resolve(strict=False)
+            if common.is_dir():
+                lock_dir = common
+    except OSError:
+        lock_dir = None
+    if lock_dir is None:
+        # Fall back to the literal ``.git`` path (a real directory in the
+        # common layouts) when resolution fails.
+        lock_dir = git_path
+    lock_path = lock_dir / "hermes-implementation.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+b")
     try:
@@ -162,13 +200,20 @@ def repository_implementation_lock(
         try:
             if os.name == "nt":
                 import msvcrt
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                if not handle.closed:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                # The contention path closes the handle before raising
+                # LockContention; unlocking a closed fd would raise
+                # ValueError and mask the LockContention the dispatcher
+                # relies on to requeue instead of fail.
+                if not handle.closed:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
-            handle.close()
+            if not handle.closed:
+                handle.close()
 
 
 def preflight_failure_result(error: PreflightError) -> dict[str, object]:
