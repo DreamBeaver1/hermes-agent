@@ -1156,12 +1156,6 @@ class Task:
     publication_required: Optional[bool] = None
     # Optional structured execution contract. None preserves legacy tasks.
     task_contract: Optional[dict] = None
-    bounded_review: bool = False
-    review_count: int = 0
-    repair_count: int = 0
-    implementation_commit: Optional[str] = None
-    implementation_session_id: Optional[str] = None
-    review_workspace: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1266,12 +1260,6 @@ class Task:
                 if "task_contract" in keys and row["task_contract"]
                 else None
             ),
-            bounded_review=bool(row["bounded_review"]) if "bounded_review" in keys else False,
-            review_count=int(row["review_count"] or 0) if "review_count" in keys else 0,
-            repair_count=int(row["repair_count"] or 0) if "repair_count" in keys else 0,
-            implementation_commit=row["implementation_commit"] if "implementation_commit" in keys else None,
-            implementation_session_id=row["implementation_session_id"] if "implementation_session_id" in keys else None,
-            review_workspace=row["review_workspace"] if "review_workspace" in keys else None,
         )
 
 
@@ -1462,13 +1450,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
     -- NULL preserves legacy semantics and is resolved by assignee at use time.
     publication_required INTEGER DEFAULT NULL,
-    task_contract        TEXT,
-    bounded_review       INTEGER NOT NULL DEFAULT 0,
-    review_count         INTEGER NOT NULL DEFAULT 0,
-    repair_count         INTEGER NOT NULL DEFAULT 0,
-    implementation_commit TEXT,
-    implementation_session_id TEXT,
-    review_workspace     TEXT
+    task_contract        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2730,18 +2712,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
     if "task_contract" not in cols:
         _add_column_if_missing(conn, "tasks", "task_contract", "task_contract TEXT")
-    if "bounded_review" not in cols:
-        _add_column_if_missing(conn, "tasks", "bounded_review", "bounded_review INTEGER NOT NULL DEFAULT 0")
-    if "review_count" not in cols:
-        _add_column_if_missing(conn, "tasks", "review_count", "review_count INTEGER NOT NULL DEFAULT 0")
-    if "repair_count" not in cols:
-        _add_column_if_missing(conn, "tasks", "repair_count", "repair_count INTEGER NOT NULL DEFAULT 0")
-    if "implementation_commit" not in cols:
-        _add_column_if_missing(conn, "tasks", "implementation_commit", "implementation_commit TEXT")
-    if "implementation_session_id" not in cols:
-        _add_column_if_missing(conn, "tasks", "implementation_session_id", "implementation_session_id TEXT")
-    if "review_workspace" not in cols:
-        _add_column_if_missing(conn, "tasks", "review_workspace", "review_workspace TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -6715,9 +6685,6 @@ def request_review(
                 "summary": event_summary or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
-                "bounded_review": bool(
-                    isinstance(metadata, dict) and metadata.get("bounded_review") is True
-                ),
             },
             run_id=run_id,
         )
