@@ -7817,6 +7817,24 @@ def _ensure_git_worktree(
             if (target_entry is not None and target_common == repo_common
                     and actual_branch == branch_name and not dirty):
                 return
+            if (target_entry is not None and target_common == repo_common
+                    and actual_branch == branch_name):
+                # Dirty but exactly owner-matched: this is THIS task's own
+                # checkout carrying preserved uncommitted work from a
+                # previous run (timeout / crash recovery). Reuse as-is so
+                # the worker decides what to do with the content —
+                # resetting or colliding here would strand or destroy
+                # task-owned work. Unrelated tasks cannot reach this
+                # branch: they fail the branch/owner checks above or the
+                # active-owner assertion in _assert_task_workspace_owner.
+                if dirty == "git-status-failed":
+                    raise _WorkspaceCollision(
+                        f"workspace collision: {target} exists; registered=True, "
+                        f"repository_match=True, branch={actual_branch!r}, "
+                        f"expected_branch={branch_name!r}, owner=kanban-task-row, "
+                        f"expected_owner={owner_id!r}, dirty=git-status-failed"
+                    )
+                return
             raise _WorkspaceCollision(
                 f"workspace collision: {target} exists; registered={target_entry is not None}, "
                 f"repository_match={target_common == repo_common}, branch={actual_branch!r}, "

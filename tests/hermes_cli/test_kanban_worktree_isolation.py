@@ -139,20 +139,58 @@ def test_correctly_owned_clean_worktree_is_reused(kanban_home, tmp_path):
     assert branch == "wt/owned"
 
 
-def test_dirty_worktree_is_preserved_collision(kanban_home, tmp_path):
+def test_dirty_owner_matched_worktree_is_reused_with_content_preserved(kanban_home, tmp_path):
+    """D5: a task-owned dirty worktree is reused, never collided.
+
+    A timed-out run leaves preserved uncommitted work in the task's own
+    worktree. Re-dispatch must resolve that same checkout (returning the
+    workspace path) instead of raising _WorkspaceCollision — the worker
+    owns the decision about the uncommitted content.
+    """
     repo = _make_repo(tmp_path)
     target = _add_worktree(repo, repo / ".worktrees" / "dirty", "wt/dirty")
     (target / "untracked.txt").write_text("keep me\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="workspace collision"):
-        kb._ensure_git_worktree(repo, target, "wt/dirty", owner_id="dirty")
+    (target / "README.md").write_text("edited\n", encoding="utf-8")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="recovery", workspace_kind="worktree",
+            workspace_path=str(target), branch_name="wt/dirty",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+    workspace, branch = kb._resolve_worktree_workspace(task)
+    assert workspace == target.resolve()
+    assert branch == "wt/dirty"
+    # The preserved work is still there, untouched.
     assert (target / "untracked.txt").read_text(encoding="utf-8") == "keep me\n"
+    assert (target / "README.md").read_text(encoding="utf-8") == "edited\n"
+    # Still a registered worktree on the expected branch.
+    assert (target / ".git").exists()
 
 
-def test_partial_unregistered_git_path_is_collision_without_add(kanban_home, tmp_path, monkeypatch):
+def test_dirty_worktree_on_wrong_branch_still_collides(kanban_home, tmp_path):
+    """D5 fail-closed: a dirty checkout on a DIFFERENT branch is preserved as a collision."""
+    repo = _make_repo(tmp_path)
+    target = _add_worktree(repo, repo / ".worktrees" / "occupied", "wt/occupied")
+    (target / "untracked.txt").write_text("other task's work\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="workspace collision"):
+        kb._ensure_git_worktree(repo, target, "wt/other-task", owner_id="t_other")
+    # The unrelated work is untouched and no new worktree was created.
+    assert (target / "untracked.txt").read_text(encoding="utf-8") == "other task's work\n"
+    head = subprocess.run(
+        ["git", "-C", str(target), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == "wt/occupied"
+
+
+def test_dirty_unregistered_git_path_still_collides(kanban_home, tmp_path, monkeypatch):
+    """D5 fail-closed: dirty-acceptance never extends to unregistered checkouts."""
     repo = _make_repo(tmp_path)
     target = repo / ".worktrees" / "partial"
     target.mkdir(parents=True)
     (target / ".git").write_text("gitdir: nowhere\n", encoding="utf-8")
+    (target / "stray.txt").write_text("not a worktree\n", encoding="utf-8")
     calls = []
     real_run = subprocess.run
     def run(*args, **kwargs):
