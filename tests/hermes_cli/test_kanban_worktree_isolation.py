@@ -126,5 +126,237 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
     assert head == "wt/sibling"
 
 
+def test_correctly_owned_clean_worktree_is_reused(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "owned"
+    _add_worktree(repo, target, "wt/owned")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="owned", workspace_kind="worktree", workspace_path=str(target), branch_name="wt/owned")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+    workspace, branch = kb._resolve_worktree_workspace(task)
+    assert workspace == target.resolve()
+    assert branch == "wt/owned"
+
+
+def test_dirty_owner_matched_worktree_is_reused_with_content_preserved(kanban_home, tmp_path):
+    """D5: a task-owned dirty worktree is reused, never collided.
+
+    A timed-out run leaves preserved uncommitted work in the task's own
+    worktree. Re-dispatch must resolve that same checkout (returning the
+    workspace path) instead of raising _WorkspaceCollision — the worker
+    owns the decision about the uncommitted content.
+    """
+    repo = _make_repo(tmp_path)
+    target = _add_worktree(repo, repo / ".worktrees" / "dirty", "wt/dirty")
+    (target / "untracked.txt").write_text("keep me\n", encoding="utf-8")
+    (target / "README.md").write_text("edited\n", encoding="utf-8")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="recovery", workspace_kind="worktree",
+            workspace_path=str(target), branch_name="wt/dirty",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+    workspace, branch = kb._resolve_worktree_workspace(task)
+    assert workspace == target.resolve()
+    assert branch == "wt/dirty"
+    # The preserved work is still there, untouched.
+    assert (target / "untracked.txt").read_text(encoding="utf-8") == "keep me\n"
+    assert (target / "README.md").read_text(encoding="utf-8") == "edited\n"
+    # Still a registered worktree on the expected branch.
+    assert (target / ".git").exists()
+
+
+def test_dirty_worktree_on_wrong_branch_still_collides(kanban_home, tmp_path):
+    """D5 fail-closed: a dirty checkout on a DIFFERENT branch is preserved as a collision."""
+    repo = _make_repo(tmp_path)
+    target = _add_worktree(repo, repo / ".worktrees" / "occupied", "wt/occupied")
+    (target / "untracked.txt").write_text("other task's work\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="workspace collision"):
+        kb._ensure_git_worktree(repo, target, "wt/other-task", owner_id="t_other")
+    # The unrelated work is untouched and no new worktree was created.
+    assert (target / "untracked.txt").read_text(encoding="utf-8") == "other task's work\n"
+    head = subprocess.run(
+        ["git", "-C", str(target), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head == "wt/occupied"
+
+
+def test_dirty_unregistered_git_path_still_collides(kanban_home, tmp_path, monkeypatch):
+    """D5 fail-closed: dirty-acceptance never extends to unregistered checkouts."""
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "partial"
+    target.mkdir(parents=True)
+    (target / ".git").write_text("gitdir: nowhere\n", encoding="utf-8")
+    (target / "stray.txt").write_text("not a worktree\n", encoding="utf-8")
+    calls = []
+    real_run = subprocess.run
+    def run(*args, **kwargs):
+        if args and isinstance(args[0], list) and args[0][0:4] == ["git", "-C", str(repo), "worktree"] and "add" in args[0]:
+            calls.append(args[0])
+        return real_run(*args, **kwargs)
+    monkeypatch.setattr(kb.subprocess, "run", run)
+    with pytest.raises(ValueError, match="workspace collision"):
+        kb._ensure_git_worktree(repo, target, "wt/partial", owner_id="partial")
+    assert calls == []
+
+
+def test_collision_is_blocked_and_not_retried(kanban_home, monkeypatch):
+    spawns = []
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="collision", assignee="alice", workspace_kind="worktree")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        monkeypatch.setattr(
+            kb, "_resolve_worktree_workspace",
+            lambda task, board=None: (_ for _ in ()).throw(
+                kb._WorkspaceCollision("workspace collision: unchanged")
+            ),
+        )
+        first = kb._dispatch_once_locked(
+            conn, spawn_fn=lambda *args, **kwargs: spawns.append(args), max_spawn=1,
+        )
+        second = kb._dispatch_once_locked(
+            conn, spawn_fn=lambda *args, **kwargs: spawns.append(args), max_spawn=1,
+        )
+        row = conn.execute("SELECT status, consecutive_failures FROM tasks WHERE id=?", (tid,)).fetchone()
+    assert row["status"] == "blocked"
+    assert row["consecutive_failures"] == 0
+    assert not spawns
+    assert not first.spawned and not second.spawned
+
+
+def test_workspace_owner_metadata_blocks_active_reuse(kanban_home, tmp_path):
+    workspace = (tmp_path / "repo" / ".worktrees" / "owner").resolve()
+    with kb.connect() as conn:
+        owner_id = kb.create_task(
+            conn, title="owner", workspace_kind="worktree",
+            workspace_path=str(workspace), branch_name="wt/owner",
+        )
+        contender_id = kb.create_task(
+            conn, title="contender", workspace_kind="worktree",
+            workspace_path=str(workspace), branch_name="wt/contender",
+        )
+        contender = kb.get_task(conn, contender_id)
+        assert contender is not None
+        with pytest.raises(ValueError, match=f"owned by task {owner_id}"):
+            kb._assert_task_workspace_owner(conn, contender, workspace)
+
+
+def test_collision_evidence_is_idempotent(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="collision")
+        kb._record_workspace_collision(conn, tid, "first collision")
+        kb._record_workspace_collision(conn, tid, "second collision")
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='infrastructure_failed' ORDER BY id",
+            (tid,),
+        ).fetchall()
+        task = conn.execute(
+            "SELECT status, last_failure_error FROM tasks WHERE id=?", (tid,)
+        ).fetchone()
+
+    assert len(events) == 1
+    assert events[0]["payload"] is not None
+    assert "first collision" in events[0]["payload"]
+    assert task["status"] == "blocked"
+    assert task["last_failure_error"] == "first collision"
+
+
+def test_collision_block_is_sticky_against_auto_repromotion(kanban_home):
+    """D6: a workspace collision must not hot-loop through re-promotion.
+
+    The collision path is deliberately non-retryable (it never increments
+    consecutive_failures), so recompute_ready's circuit breaker can never
+    free the task.  The block must therefore be sticky: repeated dispatcher
+    ticks must NOT re-claim / re-collide — the task stays parked until an
+    explicit operator unblock.
+    """
+    spawns = []
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="hot-loop", assignee="alice", workspace_kind="worktree")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        kb._record_workspace_collision(conn, tid, "workspace collision: dirty=True")
+        # First tick: the blocked task must not be re-promoted (sticky).
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "blocked"
+        # ... and a full dispatch tick must not claim/spawn it either.
+        first = kb._dispatch_once_locked(
+            conn, spawn_fn=lambda *args, **kwargs: spawns.append(args), max_spawn=1,
+        )
+        second = kb._dispatch_once_locked(
+            conn, spawn_fn=lambda *args, **kwargs: spawns.append(args), max_spawn=1,
+        )
+        assert not first.spawned and not second.spawned
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "blocked"
+        # The durable evidence carries an explicit blocked event so
+        # _has_sticky_block holds even for direct DB manipulation paths.
+        assert kb._has_sticky_block(conn, tid) is True
+        blocked_events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked'",
+            (tid,),
+        ).fetchall()
+        assert len(blocked_events) == 1
+        assert "workspace collision" in (blocked_events[0]["payload"] or "")
+
+
+def test_collision_unblock_recovers_task(kanban_home):
+    """D6: the operator exit from a collision block works (unblock → ready)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="recoverable", assignee="alice", workspace_kind="worktree")
+        kb._record_workspace_collision(conn, tid, "workspace collision: dirty=True")
+        assert kb._has_sticky_block(conn, tid) is True
+        assert kb.unblock_task(conn, tid) is True
+        assert kb._has_sticky_block(conn, tid) is False
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "ready"
+        # And now recompute_ready may promote it normally (no re-loop of the
+        # block itself — the workspace repair is the operator's job).
+        assert kb.recompute_ready(conn) >= 0
+
+
+def test_transient_lock_contention_requeue_still_auto_recovers(kanban_home, monkeypatch):
+    """D6 guard: the sticky collision block must not swallow TRANSIENT failures.
+
+    LockContention during spawn requeues the task with an implementation_queued
+    event (no blocked event) — recompute_ready must keep auto-promoting it.
+    """
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="lock-waiter", assignee="alice", workspace_kind="worktree")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=? WHERE id=?",
+            ("/tmp", tid),
+        )
+        # Simulate the post-spawn LockContention requeue exactly as the
+        # dispatcher writes it.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL WHERE id=?",
+                (tid,),
+            )
+            kb._end_run(
+                conn, tid, outcome="queued", status="requeued",
+                error="repository implementation lock contention",
+            )
+            kb._append_event(conn, tid, "implementation_queued", {"lock": "/tmp/.git/hermes-implementation.lock"})
+        # No blocked event exists → not sticky → no operator needed.  The
+        # requeue path puts the task directly back to 'ready' (claimable on
+        # the next tick); recompute_ready has nothing to do for it, and —
+        # critically — never parks it in 'blocked'.
+        assert kb._has_sticky_block(conn, tid) is False
+        assert kb.recompute_ready(conn) == 0
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "ready"
+
 
 

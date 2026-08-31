@@ -91,6 +91,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
+from hermes_cli.task_contract import contract_from_task, validate_contract
 
 _log = logging.getLogger(__name__)
 
@@ -1049,6 +1050,15 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # Data classes
 # ---------------------------------------------------------------------------
 
+def _decode_task_contract(value: Any) -> Optional[dict]:
+    """Decode stored contracts without allowing malformed JSON to crash a tick."""
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 @dataclass
 class Task:
     """In-memory view of a row from the ``tasks`` table."""
@@ -1144,6 +1154,8 @@ class Task:
     # Nullable task policy. Legacy NULL rows resolve to Forge's default only
     # at the publication gate; the stored value is never rewritten.
     publication_required: Optional[bool] = None
+    # Optional structured execution contract. None preserves legacy tasks.
+    task_contract: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1241,6 +1253,11 @@ class Task:
             publication_required=(
                 bool(row["publication_required"])
                 if "publication_required" in keys and row["publication_required"] is not None
+                else None
+            ),
+            task_contract=(
+                _decode_task_contract(row["task_contract"])
+                if "task_contract" in keys and row["task_contract"]
                 else None
             ),
         )
@@ -1432,7 +1449,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
     -- NULL preserves legacy semantics and is resolved by assignee at use time.
-    publication_required INTEGER DEFAULT NULL
+    publication_required INTEGER DEFAULT NULL,
+    task_contract        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2692,6 +2710,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "publication_required", "publication_required INTEGER DEFAULT NULL"
         )
+    if "task_contract" not in cols:
+        _add_column_if_missing(conn, "tasks", "task_contract", "task_contract TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3198,6 +3218,7 @@ def create_task(
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     publication_required: Optional[bool] = None,
+    task_contract: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3515,8 +3536,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, publication_required
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, publication_required,
+                        task_contract
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3543,6 +3565,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         None if publication_required is None else int(publication_required),
+                        json.dumps(dict(task_contract), sort_keys=True) if task_contract is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -7729,14 +7752,112 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+class _WorkspaceCollision(ValueError):
+    """A pre-existing workspace is unsafe to mutate or reuse."""
+
+
+def _worktree_metadata(output: str) -> list[dict[str, str]]:
+    blocks: list[dict[str, str]] = []
+    for raw in output.split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in raw.splitlines():
+            key, sep, value = line.partition(" ")
+            if sep:
+                fields[key] = value
+        if fields:
+            blocks.append(fields)
+    return blocks
+
+
+def _ensure_git_worktree(
+    repo_root: Path, target: Path, branch_name: str, *, owner_id: str | None = None
+) -> None:
+    """Create or safely reuse a task-owned linked worktree.
+
+    Existing paths are inspected before any mutating git command.  A path with
+    a .git entry is never passed to ``git worktree add``: it is either an exact,
+    registered, clean, correctly-owned checkout or a preserved collision.
+    """
     target = target.expanduser()
+    target_resolved = target.resolve(strict=False)
     repo_common = _git_common_dir(repo_root)
-    if target.exists() and repo_common is not None:
-        target_common = _git_common_dir(target)
-        if target_common == repo_common:
-            return
+    metadata = subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    if metadata.returncode != 0:
+        detail = (metadata.stderr or metadata.stdout or "").strip()
+        raise RuntimeError(
+            f"git worktree metadata failed for {repo_root}: {detail}"
+        )
+    blocks = _worktree_metadata(metadata.stdout)
+    target_entry = next(
+        (fields for fields in blocks
+         if Path(fields.get("worktree", "")).resolve(strict=False) == target_resolved),
+        None,
+    )
+    target_has_git = (target / ".git").exists()
+    if target.exists():
+        # Never invoke worktree creation against an existing git checkout,
+        # including partial/unregistered checkouts and ordinary repositories.
+        if target_has_git:
+            target_common = _git_common_dir(target)
+            actual_branch = _git_current_branch(target)
+            status = subprocess.run(
+                ["git", "-C", str(target), "status", "--porcelain"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=30, check=False,
+            )
+            dirty = (status.stdout or "").strip() if status.returncode == 0 else "git-status-failed"
+            # Task ownership is authoritative in the Kanban task row and is
+            # checked by _assert_task_workspace_owner before this function.
+            # Do not create a marker: it would make an otherwise clean
+            # worktree dirty under the reliability preflight.
+            if (target_entry is not None and target_common == repo_common
+                    and actual_branch == branch_name and not dirty):
+                return
+            if (target_entry is not None and target_common == repo_common
+                    and actual_branch == branch_name):
+                # Dirty but exactly owner-matched: this is THIS task's own
+                # checkout carrying preserved uncommitted work from a
+                # previous run (timeout / crash recovery). Reuse as-is so
+                # the worker decides what to do with the content —
+                # resetting or colliding here would strand or destroy
+                # task-owned work. Unrelated tasks cannot reach this
+                # branch: they fail the branch/owner checks above or the
+                # active-owner assertion in _assert_task_workspace_owner.
+                if dirty == "git-status-failed":
+                    raise _WorkspaceCollision(
+                        f"workspace collision: {target} exists; registered=True, "
+                        f"repository_match=True, branch={actual_branch!r}, "
+                        f"expected_branch={branch_name!r}, owner=kanban-task-row, "
+                        f"expected_owner={owner_id!r}, dirty=git-status-failed"
+                    )
+                return
+            raise _WorkspaceCollision(
+                f"workspace collision: {target} exists; registered={target_entry is not None}, "
+                f"repository_match={target_common == repo_common}, branch={actual_branch!r}, "
+                f"expected_branch={branch_name!r}, owner=kanban-task-row, expected_owner={owner_id!r}, "
+                f"dirty={bool(dirty)}"
+            )
+        try:
+            has_entries = any(target.iterdir())
+        except OSError:
+            has_entries = True
+        if has_entries:
+            raise _WorkspaceCollision(
+                f"workspace collision: {target} exists without registered git worktree (.git absent)"
+            )
+    for fields in blocks:
+        if (
+            fields.get("branch") == f"refs/heads/{branch_name}"
+            and Path(fields.get("worktree", "")).resolve(strict=False) != target_resolved
+        ):
+            raise ValueError(
+                f"git branch collision: {branch_name} is already checked out "
+                "by another worktree"
+            )
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
@@ -7799,7 +7920,7 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, owner_id=task.id)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -7811,31 +7932,30 @@ def _resolve_worktree_workspace(
     requested_resolved = requested.resolve(strict=False)
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
-        actual_branch = _git_current_branch(requested)
-        if actual_branch == branch_name:
-            return requested_resolved, actual_branch
-        # The requested path is an existing checkout of a DIFFERENT
-        # task's branch. Decompose children inherit the root's
-        # workspace_path verbatim, so siblings all point here; reusing
-        # the checkout as-is would run this task on the other task's
-        # branch — silent cross-task provenance corruption, and unsafe
-        # when siblings run concurrently. Fall back to a fresh worktree
-        # of our own under the same repo.
         fallback_root = _repo_root_for_worktree_target(requested.parent)
+        if fallback_root is not None and _git_current_branch(requested) == branch_name:
+            _ensure_git_worktree(
+                fallback_root, requested, branch_name, owner_id=task.id
+            )
+            return requested_resolved, branch_name
+        # A different branch is an occupied path; preserve it and materialize
+        # this task below the canonical repository instead.
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(
+                    fallback_root, fallback, branch_name, owner_id=task.id
+                )
                 return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this
-        # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
-        return requested_resolved, actual_branch or branch_name
+        raise _WorkspaceCollision(
+            f"workspace collision: {requested} is a registered worktree on "
+            f"branch {_git_current_branch(requested)!r}, expected {branch_name!r}"
+        )
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, owner_id=task.id)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -7844,8 +7964,94 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(repo_root, requested, branch_name, owner_id=task.id)
     return requested, branch_name
+
+
+def _validate_kanban_worktree(task: Task, workspace: Path, branch_name: str) -> None:
+    """Run the non-mutating reliability gate before a Kanban worker starts."""
+    from agent.reliability import repository_preflight
+
+    repo_root = _git_toplevel(workspace)
+    if repo_root is None:
+        raise ValueError(f"preflight repository missing for task {task.id}: {workspace}")
+    remote = subprocess.run(
+        ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    if remote.returncode != 0 or not remote.stdout.strip():
+        raise ValueError(f"preflight origin missing for repository {repo_root}")
+    origin_main = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "origin/main"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    if origin_main.returncode != 0:
+        raise ValueError(f"preflight origin/main missing for repository {repo_root}")
+    base = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    if base.returncode != 0:
+        raise ValueError(f"preflight base revision missing for repository {repo_root}")
+    repository_preflight(
+        workspace,
+        repository=repo_root,
+        base_revision=base.stdout.strip(),
+        expected_branch=branch_name,
+        expected_remote=remote.stdout.strip(),
+        expected_origin_main=origin_main.stdout.strip(),
+        require_clean=True,
+    )
+
+
+def _prepare_kanban_worktree(task: Task, workspace: Path, branch_name: str) -> None:
+    """Validate a task-owned worktree before worker launch.
+
+    Ownership is persisted in the task row (workspace_path + branch_name), so
+    no untracked marker is written into an otherwise clean checkout.
+    """
+    _validate_kanban_worktree(task, workspace, branch_name)
+
+
+def _assert_task_workspace_owner(
+    conn: sqlite3.Connection, task: Task, workspace: Path
+) -> None:
+    """Reject a checkout already persisted as another active task's workspace."""
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE workspace_path = ? AND id <> ? "
+        "AND status NOT IN ('done', 'archived') LIMIT 1",
+        (str(workspace), task.id),
+    ).fetchone()
+    if row is not None:
+        raise ValueError(
+            f"preflight workspace ownership collision: {workspace} "
+            f"is already owned by task {row['id']}"
+        )
+
+
+def _invoke_spawn(spawn_fn, task: Task, workspace: str, board=None):
+    """Invoke a spawn callback under the repository implementation lock."""
+    import inspect
+
+    def call():
+        try:
+            sig = inspect.signature(spawn_fn)
+            if "board" in sig.parameters:
+                return spawn_fn(task, workspace, board=board)
+        except (TypeError, ValueError):
+            pass
+        return spawn_fn(task, workspace)
+
+    repo = _git_toplevel(Path(workspace))
+    if repo is None or task.workspace_kind != "worktree":
+        return call()
+    from agent.reliability import repository_implementation_lock
+
+    with repository_implementation_lock(repo, blocking=False):
+        return call()
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
@@ -8044,6 +8250,8 @@ class DispatchResult:
     dead/gone worker). See the reconciliation pass for details."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
+    contract_blocked: list[str] = field(default_factory=list)
+    """Task ids blocked by deterministic contract/prerequisite preflight."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -9362,6 +9570,74 @@ def _record_spawn_failure(
     )
 
 
+def _record_workspace_collision(conn: sqlite3.Connection, task_id: str, error: str) -> None:
+    """Block an unsafe pre-existing workspace without consuming retries.
+
+    Collision handling can be reached by more than one dispatcher observing a
+    claimed task during recovery.  Keep the durable evidence idempotent: once
+    a collision event exists, preserve the first diagnostic and do not append
+    another event or rewrite the task's failure metadata.
+
+    The ``blocked`` status must be STICKY (D6, task t_2695927d): this failure
+    is deliberately non-retryable — the collision path never increments
+    ``consecutive_failures``, so the circuit breaker in ``recompute_ready``
+    can never free the task on its own.  If the block were non-sticky, every
+    dispatcher tick would re-claim → re-collide → re-block, an unbounded
+    hot loop (observed live: 40+ claim/collision cycles at ~60s cadence).
+    Therefore each collision write emits a ``blocked`` event too, so
+    ``_has_sticky_block`` holds and the task stays parked until an operator
+    runs ``hermes kanban unblock`` — the same contract as a worker's
+    ``kanban_block``.  The transient LockContention → requeue path is
+    unrelated and keeps its automatic recovery.
+    """
+    with write_txn(conn):
+        prior = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'infrastructure_failed' "
+            "ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+        for row in prior:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if payload.get("collision") is True:
+                first_error = str(payload.get("error") or error)
+                _end_run(
+                    conn, task_id, outcome="infrastructure_failed",
+                    status="failed", error=first_error,
+                )
+                conn.execute(
+                    "UPDATE tasks SET status='blocked', claim_lock=NULL, "
+                    "claim_expires=NULL, current_run_id=NULL, "
+                    "last_failure_error=? WHERE id=?",
+                    (first_error[:500], task_id),
+                )
+                return
+        _end_run(conn, task_id, outcome="infrastructure_failed", status="failed", error=error)
+        conn.execute(
+            "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
+            "current_run_id=NULL, last_failure_error=? WHERE id=?",
+            (error[:500], task_id),
+        )
+        _append_event(
+            conn, task_id, "infrastructure_failed",
+            {"error": error, "retryable": False, "collision": True},
+        )
+        # Sticky-block marker (see docstring): pairs the non-retryable
+        # infrastructure_failed event with an explicit "blocked" event so
+        # recompute_ready/_has_sticky_block never auto-re-promotes the task.
+        _append_event(
+            conn, task_id, "blocked",
+            {
+                "reason": f"workspace collision (non-retryable): {error[:400]}",
+                "source": "workspace_collision",
+                "resume_status": "ready",
+            },
+        )
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -10177,6 +10453,26 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        # Deterministic contract/prerequisite gate. This is deliberately before
+        # claim/workspace allocation/spawn: failures consume no retry budget.
+        full_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (row["id"],)).fetchone()
+        contract = contract_from_task(Task.from_row(full_row)) if full_row is not None else None
+        if contract is not None:
+            failure = validate_contract(contract, worker_env=os.environ)
+            if failure is not None:
+                evidence = failure.evidence
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status='blocked', block_kind='capability', "
+                        "claim_lock=NULL, claim_expires=NULL WHERE id=? AND status='ready'",
+                        (row["id"],),
+                    )
+                    _append_event(conn, row["id"], "contract_blocked", {
+                        "kind": failure.kind, "evidence": evidence,
+                        "retryable": False, "repair_consumed": False,
+                    })
+                result.contract_blocked.append(row["id"])
+                continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -10255,6 +10551,9 @@ def _dispatch_once_locked(
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
+        except _WorkspaceCollision as exc:
+            _record_workspace_collision(conn, claimed.id, str(exc))
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -10264,24 +10563,46 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
+        try:
+            _assert_task_workspace_owner(conn, claimed, Path(workspace).resolve(strict=False))
+        except Exception as exc:
+            with write_txn(conn):
+                _end_run(conn, claimed.id, outcome="infrastructure_failed", status="failed", error=f"preflight: {exc}")
+                conn.execute("UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (claimed.id,))
+                _append_event(conn, claimed.id, "infrastructure_failed", {"error": f"preflight: {exc}", "retryable": False})
+            continue
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if claimed.workspace_kind == "worktree":
+            try:
+                _prepare_kanban_worktree(
+                    claimed, Path(workspace),
+                    resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
+                )
+            except Exception as exc:
+                with write_txn(conn):
+                    _end_run(
+                        conn, claimed.id, outcome="infrastructure_failed",
+                        status="failed", error=f"preflight: {exc}",
+                    )
+                    conn.execute(
+                        "UPDATE tasks SET status='blocked', claim_lock=NULL, "
+                        "claim_expires=NULL, current_run_id=NULL WHERE id=?",
+                        (claimed.id,),
+                    )
+                    _append_event(
+                        conn, claimed.id, "infrastructure_failed",
+                        {"error": f"preflight: {exc}", "retryable": False},
+                    )
+                continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            pid = _invoke_spawn(_spawn, claimed, str(workspace), board=board)
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
@@ -10308,6 +10629,21 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            from agent.reliability import LockContention
+            if isinstance(exc, LockContention):
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                        "claim_expires=NULL WHERE id=?",
+                        (claimed.id,),
+                    )
+                    _end_run(
+                        conn, claimed.id, outcome="queued", status="requeued",
+                        error="repository implementation lock contention",
+                    )
+                    _append_event(conn, claimed.id, "implementation_queued", {"lock": str(exc)})
+                result.respawn_guarded.append((claimed.id, "repository_lock"))
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -10382,6 +10718,9 @@ def _dispatch_once_locked(
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
+        except _WorkspaceCollision as exc:
+            _record_workspace_collision(conn, claimed.id, str(exc))
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -10391,6 +10730,14 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
+        try:
+            _assert_task_workspace_owner(conn, claimed, Path(workspace).resolve(strict=False))
+        except Exception as exc:
+            with write_txn(conn):
+                _end_run(conn, claimed.id, outcome="infrastructure_failed", status="failed", error=f"preflight: {exc}")
+                conn.execute("UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, current_run_id=NULL WHERE id=?", (claimed.id,))
+                _append_event(conn, claimed.id, "infrastructure_failed", {"error": f"preflight: {exc}", "retryable": False})
+            continue
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
@@ -10405,15 +10752,7 @@ def _dispatch_once_locked(
         )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            pid = _invoke_spawn(_spawn, claimed, str(workspace), board=board)
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): same contract as the
