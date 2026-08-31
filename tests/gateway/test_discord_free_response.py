@@ -228,13 +228,19 @@ async def test_discord_accepts_and_strips_bot_mentions_when_required(adapter, mo
 
 
 @pytest.mark.asyncio
-async def test_discord_reply_message_skips_auto_thread(adapter, monkeypatch):
-    """Quote-replies should stay in-channel instead of trying to create a thread."""
-    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+async def test_discord_reply_message_auto_threads_root_message(adapter, monkeypatch):
+    """Quote-replies are substantive root messages and must auto-thread.
+
+    Policy (fb663d98, 2aadb8bc): every non-bare-slash message in a regular
+    non-no-thread channel threads, including replies.  Only the bare slash
+    command and no_thread_channels escape threading.
+    """
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)  # default true
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "123")
 
-    adapter._auto_create_thread = AsyncMock()
+    fake_thread = SimpleNamespace(id="thread-1", name="t")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
 
     message = make_message(
         channel=FakeTextChannel(channel_id=123),
@@ -244,23 +250,29 @@ async def test_discord_reply_message_skips_auto_thread(adapter, monkeypatch):
 
     await adapter._handle_message(message)
 
-    adapter._auto_create_thread.assert_not_awaited()
+    adapter._auto_create_thread.assert_awaited_once_with(message)
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "reply without mention"
-    assert event.source.chat_id == "123"
-    assert event.source.chat_type == "group"
+    assert event.source.chat_id == "thread-1"
+    assert event.source.chat_type == "thread"
 
 
 @pytest.mark.asyncio
-async def test_discord_voice_linked_channel_skips_mention_requirement_and_auto_thread(adapter, monkeypatch):
-    """Active voice-linked text channels should behave like free-response channels."""
+async def test_discord_voice_linked_channel_auto_threads_root_message(adapter, monkeypatch):
+    """Voice-linked free-response bypasses mention gating but not threading.
+
+    Policy (2aadb8bc): the voice-link exemption only lifts the @mention
+    requirement; the root message still threads like any other channel.
+    """
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
-    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)  # default true
+
+    fake_thread = SimpleNamespace(id="thread-1", name="t")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
 
     adapter._voice_text_channels[111] = 789
-    adapter._auto_create_thread = AsyncMock()
 
     message = make_message(
         channel=FakeTextChannel(channel_id=789),
@@ -269,29 +281,27 @@ async def test_discord_voice_linked_channel_skips_mention_requirement_and_auto_t
 
     await adapter._handle_message(message)
 
-    adapter._auto_create_thread.assert_not_awaited()
+    adapter._auto_create_thread.assert_awaited_once_with(message)
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "follow-up from voice text chat"
-    assert event.source.chat_type == "group"
+    assert event.source.chat_type == "thread"
 
 
 @pytest.mark.asyncio
-async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypatch):
-    """Free-response channels should reply inline, never spawn a new thread.
+async def test_discord_free_response_channel_auto_threads_root_message(adapter, monkeypatch):
+    """Free-response channels thread their root messages.
 
-    Without this, every message in a free-response channel would auto-create
-    a fresh thread (since the channel bypasses the @mention gate, every
-    message looks like a fresh trigger).  That turns a "lightweight chat"
-    channel into a thread-spawning machine — see the docs at
-    website/docs/user-guide/messaging/discord.md which already describe
-    this as the intended behavior.
+    Policy (fb663d98): free-response is only a mention-gate bypass; the root
+    message still spawns a thread like any other channel.  Only bare slash
+    commands and no_thread_channels reply inline.
     """
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)  # default true
 
-    adapter._auto_create_thread = AsyncMock()
+    fake_thread = SimpleNamespace(id="thread-1", name="t")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
 
     message = make_message(
         channel=FakeTextChannel(channel_id=789),
@@ -300,11 +310,11 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
 
     await adapter._handle_message(message)
 
-    adapter._auto_create_thread.assert_not_awaited()
+    adapter._auto_create_thread.assert_awaited_once_with(message)
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "casual chat in free-response channel"
-    assert event.source.chat_type == "group"
+    assert event.source.chat_type == "thread"
 
 
 @pytest.mark.asyncio

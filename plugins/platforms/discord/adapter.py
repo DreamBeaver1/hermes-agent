@@ -8167,9 +8167,13 @@ class DiscordAdapter(BasePlatformAdapter):
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             # Slash commands are control-plane operations.  Keep them inline so
             # /status, /help, /new, etc. do not create a conversation thread.
-            # ``normalized_content`` is used because mention stripping above
-            # may have changed ``message.content``.
-            is_slash_command = normalized_content.startswith("/")
+            # Only a BARE slash command (the message itself starts with "/")
+            # qualifies: a mention-prefixed command like "<@BOT> /help" is a
+            # substantive message and must auto-thread.  ``raw_content`` is
+            # snapshotted before mention stripping and before create_thread()
+            # can clobber ``message.content``, so mention stripping must not
+            # reclassify a mention-prefixed command as a bare one.
+            is_slash_command = raw_content.startswith("/")
             if auto_thread and not is_slash_command and not skip_thread:
                 thread = await self._auto_create_thread(message)
                 if thread:

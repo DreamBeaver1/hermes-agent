@@ -243,3 +243,115 @@ def test_normal_lock_acquisition_still_succeeds(tmp_path: Path) -> None:
         entered.set()
         inside.wait(0.1)
     assert entered.is_set()
+
+
+_HOLDER_SCRIPT = """\
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, {repo_root!r})
+from agent.reliability import repository_implementation_lock
+
+worktree = Path({worktree!r})
+held_signal = Path({held_signal!r})
+release_signal = Path({release_signal!r})
+
+with repository_implementation_lock(worktree):
+    held_signal.write_text("held", encoding="utf-8")
+    deadline = time.monotonic() + 15
+    while not release_signal.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+"""
+
+_PROBER_SCRIPT = """\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, {repo_root!r})
+from agent.reliability import LockContention, repository_implementation_lock
+
+worktree = Path({worktree!r})
+
+try:
+    with repository_implementation_lock(worktree, blocking=False):
+        print("ACQUIRED")
+except LockContention:
+    print("CONTENTION")
+"""
+
+
+def test_lock_contention_across_processes_on_sibling_worktrees(tmp_path: Path) -> None:
+    """Cross-process stress: sibling worktrees contend on one shared lock.
+
+    Complements the thread-based tests above: flock contention must hold
+    across process boundaries too, since the dispatcher and spawned workers
+    are separate processes.  Holder process A pins the lock via wt1; prober
+    process B must see LockContention through wt2 while A holds, then
+    acquire cleanly after A releases.  Bounded waits keep it CI-deterministic.
+    """
+    import os
+    import subprocess
+    import sys
+    import time
+
+    repo_root = Path(__file__).resolve().parents[2]
+    repo, _ = _repo(tmp_path)
+    wt1 = tmp_path / "wt1"
+    wt2 = tmp_path / "wt2"
+    _add_worktree(repo, wt1)
+    _add_worktree(repo, wt2)
+
+    held_signal = tmp_path / "held.signal"
+    release_signal = tmp_path / "release.signal"
+    holder = tmp_path / "holder.py"
+    prober = tmp_path / "prober.py"
+    holder.write_text(
+        _HOLDER_SCRIPT.format(
+            repo_root=str(repo_root), worktree=str(wt1),
+            held_signal=str(held_signal), release_signal=str(release_signal),
+        ),
+        encoding="utf-8",
+    )
+    prober.write_text(
+        _PROBER_SCRIPT.format(repo_root=str(repo_root), worktree=str(wt2)),
+        encoding="utf-8",
+    )
+
+    env = dict(os.environ)
+    env.pop("HERMES_TEST_FILE_RETRIES", None)
+    python = sys.executable
+
+    def run_prober() -> str:
+        result = subprocess.run(
+            [python, str(prober)], capture_output=True, text=True,
+            timeout=30, env=env, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    holder_proc = subprocess.Popen(
+        [python, str(holder)], stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE, env=env,
+    )
+    try:
+        # Wait until the holder actually owns the flock (bounded poll).
+        deadline = time.monotonic() + 15
+        while not held_signal.exists() and time.monotonic() < deadline:
+            if holder_proc.poll() is not None:
+                pytest.fail(
+                    "holder exited before acquiring: "
+                    + holder_proc.stderr.read().decode(errors="replace")
+                )
+            time.sleep(0.05)
+        assert held_signal.exists(), "holder never acquired the lock"
+
+        # While A holds, B must observe contention through the sibling
+        # worktree (shared git common dir).
+        assert run_prober() == "CONTENTION"
+    finally:
+        release_signal.write_text("release", encoding="utf-8")
+        holder_proc.wait(timeout=20)
+
+    # After A releases, B must acquire cleanly.
+    assert run_prober() == "ACQUIRED"

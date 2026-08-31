@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from tools.environments.local import build_subprocess_env
+
 MODES = {"evidence_only", "local_commit", "push_branch", "pull_request"}
 REQUIRED_FIELDS = (
     "repository", "base_revision", "implementation_scope", "non_goals",
@@ -46,7 +48,12 @@ def _run(argv: list[str], *, cwd: Path | None = None) -> tuple[bool, str]:
     try:
         p = subprocess.run(argv, cwd=str(cwd) if cwd else None, capture_output=True,
                            text=True, encoding="utf-8", errors="replace", check=False,
-                           timeout=30, env=os.environ.copy())
+                           timeout=30,
+                           # Exact legacy os.environ.copy() semantics: no secret
+                           # scrubbing, no profile-home rewriting — pre-flight git
+                           # and subprocess probes must see the full inherited env.
+                           env=build_subprocess_env(scrub_secrets=False,
+                                                    inherit_profile_home=False))
         detail = (p.stderr or p.stdout or "").strip()
         return p.returncode == 0, _redact(f"$ {' '.join(argv)}\n{detail}")
     except (OSError, subprocess.SubprocessError) as exc:
