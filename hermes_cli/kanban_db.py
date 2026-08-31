@@ -9577,6 +9577,18 @@ def _record_workspace_collision(conn: sqlite3.Connection, task_id: str, error: s
     claimed task during recovery.  Keep the durable evidence idempotent: once
     a collision event exists, preserve the first diagnostic and do not append
     another event or rewrite the task's failure metadata.
+
+    The ``blocked`` status must be STICKY (D6, task t_2695927d): this failure
+    is deliberately non-retryable — the collision path never increments
+    ``consecutive_failures``, so the circuit breaker in ``recompute_ready``
+    can never free the task on its own.  If the block were non-sticky, every
+    dispatcher tick would re-claim → re-collide → re-block, an unbounded
+    hot loop (observed live: 40+ claim/collision cycles at ~60s cadence).
+    Therefore each collision write emits a ``blocked`` event too, so
+    ``_has_sticky_block`` holds and the task stays parked until an operator
+    runs ``hermes kanban unblock`` — the same contract as a worker's
+    ``kanban_block``.  The transient LockContention → requeue path is
+    unrelated and keeps its automatic recovery.
     """
     with write_txn(conn):
         prior = conn.execute(
@@ -9612,6 +9624,17 @@ def _record_workspace_collision(conn: sqlite3.Connection, task_id: str, error: s
         _append_event(
             conn, task_id, "infrastructure_failed",
             {"error": error, "retryable": False, "collision": True},
+        )
+        # Sticky-block marker (see docstring): pairs the non-retryable
+        # infrastructure_failed event with an explicit "blocked" event so
+        # recompute_ready/_has_sticky_block never auto-re-promotes the task.
+        _append_event(
+            conn, task_id, "blocked",
+            {
+                "reason": f"workspace collision (non-retryable): {error[:400]}",
+                "source": "workspace_collision",
+                "resume_status": "ready",
+            },
         )
 
 

@@ -267,4 +267,96 @@ def test_collision_evidence_is_idempotent(kanban_home):
     assert task["last_failure_error"] == "first collision"
 
 
+def test_collision_block_is_sticky_against_auto_repromotion(kanban_home):
+    """D6: a workspace collision must not hot-loop through re-promotion.
+
+    The collision path is deliberately non-retryable (it never increments
+    consecutive_failures), so recompute_ready's circuit breaker can never
+    free the task.  The block must therefore be sticky: repeated dispatcher
+    ticks must NOT re-claim / re-collide — the task stays parked until an
+    explicit operator unblock.
+    """
+    spawns = []
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="hot-loop", assignee="alice", workspace_kind="worktree")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        kb._record_workspace_collision(conn, tid, "workspace collision: dirty=True")
+        # First tick: the blocked task must not be re-promoted (sticky).
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "blocked"
+        # ... and a full dispatch tick must not claim/spawn it either.
+        first = kb._dispatch_once_locked(
+            conn, spawn_fn=lambda *args, **kwargs: spawns.append(args), max_spawn=1,
+        )
+        second = kb._dispatch_once_locked(
+            conn, spawn_fn=lambda *args, **kwargs: spawns.append(args), max_spawn=1,
+        )
+        assert not first.spawned and not second.spawned
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "blocked"
+        # The durable evidence carries an explicit blocked event so
+        # _has_sticky_block holds even for direct DB manipulation paths.
+        assert kb._has_sticky_block(conn, tid) is True
+        blocked_events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked'",
+            (tid,),
+        ).fetchall()
+        assert len(blocked_events) == 1
+        assert "workspace collision" in (blocked_events[0]["payload"] or "")
+
+
+def test_collision_unblock_recovers_task(kanban_home):
+    """D6: the operator exit from a collision block works (unblock → ready)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="recoverable", assignee="alice", workspace_kind="worktree")
+        kb._record_workspace_collision(conn, tid, "workspace collision: dirty=True")
+        assert kb._has_sticky_block(conn, tid) is True
+        assert kb.unblock_task(conn, tid) is True
+        assert kb._has_sticky_block(conn, tid) is False
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "ready"
+        # And now recompute_ready may promote it normally (no re-loop of the
+        # block itself — the workspace repair is the operator's job).
+        assert kb.recompute_ready(conn) >= 0
+
+
+def test_transient_lock_contention_requeue_still_auto_recovers(kanban_home, monkeypatch):
+    """D6 guard: the sticky collision block must not swallow TRANSIENT failures.
+
+    LockContention during spawn requeues the task with an implementation_queued
+    event (no blocked event) — recompute_ready must keep auto-promoting it.
+    """
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="lock-waiter", assignee="alice", workspace_kind="worktree")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=? WHERE id=?",
+            ("/tmp", tid),
+        )
+        # Simulate the post-spawn LockContention requeue exactly as the
+        # dispatcher writes it.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL WHERE id=?",
+                (tid,),
+            )
+            kb._end_run(
+                conn, tid, outcome="queued", status="requeued",
+                error="repository implementation lock contention",
+            )
+            kb._append_event(conn, tid, "implementation_queued", {"lock": "/tmp/.git/hermes-implementation.lock"})
+        # No blocked event exists → not sticky → no operator needed.  The
+        # requeue path puts the task directly back to 'ready' (claimable on
+        # the next tick); recompute_ready has nothing to do for it, and —
+        # critically — never parks it in 'blocked'.
+        assert kb._has_sticky_block(conn, tid) is False
+        assert kb.recompute_ready(conn) == 0
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "ready"
+
+
 
