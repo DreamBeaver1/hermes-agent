@@ -502,6 +502,7 @@ class AIAgent:
         tool_delay: float = None,  # Deprecated: accepted for compatibility, ignored
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
+        allowed_tools: List[str] = None,
         save_trajectories: bool = False,
         verbose_logging: bool = False,
         quiet_mode: bool = False,
@@ -595,6 +596,7 @@ class AIAgent:
             max_iterations=max_iterations,
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
+            allowed_tools=allowed_tools,
             save_trajectories=save_trajectories,
             verbose_logging=verbose_logging,
             quiet_mode=quiet_mode,

@@ -8194,6 +8194,10 @@ def refresh_agent_mcp_tools(
     else:
         enabled = getattr(agent, "enabled_toolsets", None)
         disabled = getattr(agent, "disabled_toolsets", None)
+    # Exact-name allowlist (delegated children): re-applied on EVERY rebuild
+    # so a registry/MCP refresh can never re-add a tool the child was not
+    # granted. None = no allowlist configured (unchanged behavior).
+    allowed = getattr(agent, "allowed_tools", None)
 
     # Capture the registry generation this rebuild is derived from BEFORE the
     # (potentially slow) get_tool_definitions call. Used at publish time to
@@ -8211,6 +8215,7 @@ def refresh_agent_mcp_tools(
         get_tool_definitions(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
+            allowed_tools=allowed,
             quiet_mode=quiet_mode,
         )
         or []
@@ -8226,6 +8231,23 @@ def refresh_agent_mcp_tools(
     # half-swap. ``staged_engine_names`` are the context-engine routing names
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+
+    # Allowlist re-clamp AFTER post-build reinjection: the injected
+    # memory-provider / context-engine families bypass get_tool_definitions'
+    # exact-name filter, so re-apply it here (staged, pre-publish) to keep the
+    # boundary over the FULL surface. No-op when no allowlist is configured.
+    if allowed is not None:
+        _allowed_names = {str(n) for n in allowed}
+        _kept = [t for t in new_defs if t.get("function", {}).get("name") in _allowed_names]
+        _dropped = len(new_defs) - len(_kept)
+        if _dropped:
+            new_defs = _kept
+            new_names = {t["function"]["name"] for t in new_defs}
+            staged_engine_names &= new_names
+            logger.info(
+                "allowed_tools re-clamp on refresh: dropped %d tool(s) outside "
+                "the child allowlist", _dropped,
+            )
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a

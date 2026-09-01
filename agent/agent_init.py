@@ -547,6 +547,7 @@ def init_agent(
     max_iterations: int = sys.maxsize,  # Default: unlimited tool-calling iterations (shared with subagents)
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
+    allowed_tools: List[str] = None,
     save_trajectories: bool = False,
     verbose_logging: bool = False,
     quiet_mode: bool = False,
@@ -628,6 +629,10 @@ def init_agent(
         max_iterations (int): Maximum number of tool calling iterations (default: 90)
         enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
         disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
+        allowed_tools (List[str]): Exact tool-name allowlist for delegated children
+            (optional). ``None`` = no exact-name boundary (default, existing
+            behavior). A list — including an empty one — restricts the model-facing
+            tool surface to exactly these names and survives MCP/plugin refreshes.
         save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
         verbose_logging (bool): Enable verbose logging for debugging (default: False)
         quiet_mode (bool): Suppress progress output for clean CLI experience (default: False)
@@ -959,6 +964,8 @@ def init_agent(
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
+    # Exact tool-name allowlist (delegated children). None = no boundary.
+    agent.allowed_tools = list(allowed_tools) if allowed_tools is not None else None
     
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
@@ -1613,6 +1620,7 @@ def init_agent(
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
+        allowed_tools=allowed_tools,
         quiet_mode=agent.quiet_mode,
     )
     
@@ -2972,6 +2980,26 @@ def init_agent(
             agent.valid_tool_names.add(_tname)
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
+
+    # ── allowed_tools final clamp (delegated children) ──────────────────
+    # Memory-provider and context-engine tools are injected AFTER the
+    # get_tool_definitions() snapshot, bypassing the exact-name allowlist
+    # that snapshot applied. Re-apply it here so the boundary holds for the
+    # FULL post-build surface. None = no allowlist configured (no-op).
+    if getattr(agent, "allowed_tools", None) is not None:
+        _allowed_names = {str(n) for n in agent.allowed_tools}
+        _clamped_tools = []
+        _clamped_names = set()
+        for _td in agent.tools:
+            _n = (_td.get("function") or {}).get("name")
+            if _n in _allowed_names:
+                _clamped_tools.append(_td)
+                if _n:
+                    _clamped_names.add(_n)
+        agent.tools = _clamped_tools
+        agent.valid_tool_names = _clamped_names
+        if isinstance(getattr(agent, "_context_engine_tool_names", None), set):
+            agent._context_engine_tool_names &= _clamped_names
 
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:
