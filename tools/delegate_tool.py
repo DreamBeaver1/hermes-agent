@@ -1115,13 +1115,20 @@ def _get_allowed_tools() -> Optional[List[str]]:
     if val is None:
         return None
     if not isinstance(val, (list, tuple, set)):
-        logger.warning(
-            "delegation.allowed_tools=%r is not a list; ignoring it entirely "
-            "(children keep their default toolsets). Use a YAML list of "
-            "exact tool names.",
+        # FAIL CLOSED: an explicit-but-malformed value is a configuration
+        # error, not an absence of configuration. Resolving it to ``None``
+        # would mean "no exact-name boundary" — i.e. silently BROADENING the
+        # child's capability beyond what the operator asked for. Instead the
+        # child gets zero allowlisted tools. (Absent/None remains the only
+        # path to the default inherited behavior.)
+        logger.error(
+            "delegation.allowed_tools=%r is not a list; failing CLOSED — "
+            "children get zero allowlisted tools until the config is fixed. "
+            "Use a YAML list of exact tool names (or remove the key entirely "
+            "to restore the default inherited toolsets).",
             val,
         )
-        return None
+        return []
     raw_names = [str(name).strip() for name in val if str(name or "").strip()]
     try:
         from tools.registry import registry as _registry
@@ -1906,15 +1913,26 @@ def _build_child_agent(
     # narrows it to the parent's legitimate surface up front.
     if child_allowed_tools is not None:
         parent_tool_names: Optional[set] = None
-        if parent_agent is not None and getattr(parent_agent, "valid_tool_names", None):
-            parent_tool_names = set(parent_agent.valid_tool_names)
-        if parent_tool_names:
+        parent_names_attr = (
+            getattr(parent_agent, "valid_tool_names", None)
+            if parent_agent is not None
+            else None
+        )
+        if isinstance(parent_names_attr, (set, frozenset, list, tuple)):
+            # The attribute EXISTS as a real collection — trust it exactly,
+            # INCLUDING the empty set. An intentionally-empty parent tool
+            # surface must yield an empty child allowlist (child ⊆ parent's
+            # ACTUAL resolved model-facing tools), never the toolset-derived
+            # fallback below.
+            parent_tool_names = set(parent_names_attr)
+        if parent_tool_names is not None:
             child_allowed_tools = [
                 name for name in child_allowed_tools if name in parent_tool_names
             ]
         else:
-            # Parent tool names unavailable (mock/test parents) — fall back to
-            # the toolset-derived set so the intersection still applies.
+            # Parent tool names UNAVAILABLE (attribute missing/None — e.g.
+            # mock/test parents): fall back to the toolset-derived set so the
+            # intersection still applies.
             import model_tools as _mt
 
             parent_tool_names = {

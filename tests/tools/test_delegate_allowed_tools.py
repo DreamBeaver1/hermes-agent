@@ -126,12 +126,13 @@ class TestGetAllowedToolsConfigParsing(unittest.TestCase):
         with patch("tools.delegate_tool._load_config", return_value={}):
             self.assertIsNone(_get_allowed_tools())
 
-    def test_non_list_is_ignored_not_silently_broadened(self):
+    def test_non_list_fails_closed_not_silently_broadened(self):
         # A string like "read_file" must NOT be reinterpreted char-by-char
-        # or as a single-name grant: fail safe to None with a warning.
+        # or as a single-name grant, and must NOT fall back to None (= no
+        # boundary = broadening). It fails CLOSED to zero tools.
         with patch("tools.delegate_tool._load_config",
                    return_value={"allowed_tools": "read_file"}):
-            self.assertIsNone(_get_allowed_tools())
+            self.assertEqual(_get_allowed_tools(), [])
 
     def test_unknown_names_dropped_with_warning(self):
         with (
@@ -165,6 +166,40 @@ class TestGetAllowedToolsConfigParsing(unittest.TestCase):
                   return_value=["read_file"]),
         ):
             self.assertEqual(_get_allowed_tools(), [])
+
+    def test_malformed_explicit_value_fails_closed_to_empty(self):
+        """PR #3 review follow-up: an explicit MALFORMED (non-list) value is
+        a configuration error and must FAIL CLOSED — it must never resolve to
+        ``None`` (= 'no exact-name boundary' = capability broadening)."""
+        for malformed in ("read_file", 42, {"read_file": True}, 3.14, True):
+            with self.subTest(malformed=malformed):
+                with (
+                    patch("tools.delegate_tool._load_config",
+                          return_value={"allowed_tools": malformed}),
+                    patch("tools.registry.registry.get_all_tool_names",
+                          return_value=["read_file", "write_file", "terminal"]),
+                ):
+                    self.assertEqual(_get_allowed_tools(), [])
+
+    def test_malformed_config_child_cannot_broaden_capability(self):
+        """End-to-end: malformed explicit config → child kwargs carry an
+        empty allowlist (zero tools), not None (inherited everything)."""
+        parent = _make_mock_parent(
+            enabled_toolsets=["file", "terminal", "web"],
+            valid_tool_names=set(READ_ONLY_ALLOWLIST) | set(MUTATION_TOOLS),
+        )
+        kwargs = _build_child_with_allowlist(parent, "read_file")  # string
+        self.assertEqual(kwargs["allowed_tools"], [])
+        self.assertEqual(_resolve_child_tools(kwargs), set())
+
+    def test_absent_config_still_means_none_backward_compat(self):
+        """Guard the companion invariant: only a MALFORMED EXPLICIT value
+        fails closed; absent/None config keeps returning None."""
+        for absent in ({}, {"allowed_tools": None}):
+            with self.subTest(config=absent):
+                with patch("tools.delegate_tool._load_config",
+                           return_value=absent):
+                    self.assertIsNone(_get_allowed_tools())
 
 
 class TestModelToolsAllowlistClamp(unittest.TestCase):
@@ -341,6 +376,35 @@ class TestChildConstructionAllowlist(unittest.TestCase):
         kwargs = _build_child_with_allowlist(parent, [])
         self.assertEqual(kwargs["allowed_tools"], [])
         self.assertEqual(_resolve_child_tools(kwargs), set())
+
+    def test_empty_parent_tool_surface_keeps_child_empty(self):
+        """PR #3 review follow-up: a parent whose ACTUAL resolved tool
+        surface is the intentionally-empty set() must keep the child empty —
+        broad enabled_toolsets plus a nonempty allowlist must NOT trigger the
+        toolset-derived fallback (child ⊆ parent's real tools)."""
+        parent = _make_mock_parent(
+            enabled_toolsets=["file", "terminal", "web", "code_execution"],
+            valid_tool_names=set(),  # exists and is intentionally EMPTY
+        )
+        self.assertEqual(parent.valid_tool_names, set())
+        kwargs = _build_child_with_allowlist(parent, READ_ONLY_ALLOWLIST)
+        self.assertEqual(kwargs["allowed_tools"], [])
+        self.assertEqual(_resolve_child_tools(kwargs), set())
+
+    def test_missing_parent_tool_names_attr_still_falls_back(self):
+        """The companion case: when valid_tool_names is UNAVAILABLE (missing
+        attribute / non-collection, e.g. MagicMock auto-attrs or None), the
+        toolset-derived fallback intersection still applies."""
+        parent = _make_mock_parent(
+            enabled_toolsets=["file"],
+            valid_tool_names=set(READ_ONLY_ALLOWLIST) | set(MUTATION_TOOLS),
+        )
+        parent.valid_tool_names = None  # attribute exists but is unusable
+        kwargs = _build_child_with_allowlist(parent, READ_ONLY_ALLOWLIST)
+        # Fallback derives from parent toolsets ("file"), so tools outside
+        # that toolset are still dropped — intersection remains in force.
+        self.assertNotIn("web_search", kwargs["allowed_tools"])
+        self.assertNotIn("terminal", kwargs["allowed_tools"])
 
     def test_batch_children_receive_same_restriction(self):
         """Scenario 13: every child in a batch gets the identical allowlist."""
