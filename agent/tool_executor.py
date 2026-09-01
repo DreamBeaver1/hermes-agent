@@ -395,11 +395,13 @@ def _tool_search_scoped_names(agent) -> frozenset:
 
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
+    allowed = getattr(agent, "allowed_tools", None)
     cache_key = (
         _registry.current_scope_key(),
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
+        frozenset(allowed) if allowed is not None else None,
     )
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:
@@ -408,6 +410,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
         scoped_defs = model_tools.get_tool_definitions(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
+            allowed_tools=allowed,
             quiet_mode=True,
             skip_tool_search_assembly=True,
         ) or []
@@ -2534,6 +2537,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            allowed_tools=getattr(agent, "allowed_tools", None),
                         )
 
                 (
@@ -2616,6 +2620,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            allowed_tools=getattr(agent, "allowed_tools", None),
                         )
 
                 (

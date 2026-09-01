@@ -1089,6 +1089,71 @@ def _get_inherit_mcp_toolsets() -> bool:
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
 
 
+def _get_allowed_tools() -> Optional[List[str]]:
+    """Read delegation.allowed_tools — an exact tool-name allowlist for children.
+
+    Contract (generic delegation security, task t_6d6c4457):
+
+    - ``None``/absent (default): NO exact-name boundary. Children keep the
+      existing inherited-toolset behavior — full backward compatibility.
+    - A list (INCLUDING an empty one): the child's final model-facing tool
+      set is the INTERSECTION of (a) the tools the parent legitimately has,
+      (b) the existing DELEGATE_BLOCKED_TOOLS / leaf restrictions, and
+      (c) exactly these names. Anything else — tools introduced by a Hermes
+      update, a plugin, or a late MCP connection — stays unavailable unless
+      explicitly added here.
+
+    Validation is fail-closed: unknown names and blocked tools are DROPPED
+    with a logged warning (never silently broadened, never granted just
+    because they were requested). The list is also validated again at the
+    tool-resolution layer (model_tools.get_tool_definitions), which is the
+    actual hard boundary — this function only strips the obviously-wrong
+    entries early so the operator sees the warning at spawn time.
+    """
+    cfg = _load_config()
+    val = cfg.get("allowed_tools")
+    if val is None:
+        return None
+    if not isinstance(val, (list, tuple, set)):
+        logger.warning(
+            "delegation.allowed_tools=%r is not a list; ignoring it entirely "
+            "(children keep their default toolsets). Use a YAML list of "
+            "exact tool names.",
+            val,
+        )
+        return None
+    raw_names = [str(name).strip() for name in val if str(name or "").strip()]
+    try:
+        from tools.registry import registry as _registry
+
+        known = set(_registry.get_all_tool_names())
+    except Exception:
+        known = set()
+    if not known:
+        # Fallback when the registry has not been populated in this process
+        # yet: accept as-is and let get_tool_definitions be the boundary.
+        return sorted(dict.fromkeys(raw_names))
+    unknown = [n for n in raw_names if n not in known]
+    if unknown:
+        logger.warning(
+            "delegation.allowed_tools contains unknown tool name(s): %s. "
+            "They are ignored — the allowlist never grants tools that do "
+            "not exist.",
+            ", ".join(sorted(unknown)),
+        )
+    blocked = [n for n in raw_names if n in DELEGATE_BLOCKED_TOOLS]
+    if blocked:
+        logger.warning(
+            "delegation.allowed_tools contains child-blocked tool(s): %s. "
+            "They stay blocked — existing DELEGATE_BLOCKED_TOOLS restrictions "
+            "are authoritative over the allowlist.",
+            ", ".join(sorted(set(blocked))),
+        )
+    effective = [n for n in raw_names
+                 if n in known and n not in DELEGATE_BLOCKED_TOOLS]
+    return sorted(dict.fromkeys(effective))
+
+
 def _is_mcp_toolset_name(name: str) -> bool:
     """Return True for canonical MCP toolsets and their registered aliases."""
     if not name:
@@ -1757,6 +1822,16 @@ def _build_child_agent(
 
     delegation_cfg = _load_config()
 
+    # ── delegation.allowed_tools (exact-name child allowlist) ───────────
+    # Optional hard boundary: when set, the child's FINAL model-facing tool
+    # set is the intersection of (parent's tools) ∩ (existing child
+    # restrictions) ∩ (exactly these names). The list is passed through to
+    # AIAgent → get_tool_definitions, which applies it as the final
+    # subtraction after every toolset/plugin/MCP expansion — so registry and
+    # MCP refreshes during the child's lifetime can never re-add a tool
+    # outside it. None/absent = default behavior, zero change.
+    child_allowed_tools = _get_allowed_tools()
+
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
     # Note: enabled_toolsets=None means "all tools enabled" (the default),
@@ -1822,6 +1897,34 @@ def _build_child_agent(
     # test_intersection_preserves_delegation_bound test for the design rationale.
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
+
+    # Rule 4 of the allowlist contract: a tool the parent does not possess
+    # must NOT be granted just because it is allowlisted. Intersect the
+    # allowlist with the parent's actually-loaded tool names. The final
+    # hard boundary is still applied inside get_tool_definitions (which
+    # re-clamps after toolset/MCP/plugin expansion); this pre-intersection
+    # narrows it to the parent's legitimate surface up front.
+    if child_allowed_tools is not None:
+        parent_tool_names: Optional[set] = None
+        if parent_agent is not None and getattr(parent_agent, "valid_tool_names", None):
+            parent_tool_names = set(parent_agent.valid_tool_names)
+        if parent_tool_names:
+            child_allowed_tools = [
+                name for name in child_allowed_tools if name in parent_tool_names
+            ]
+        else:
+            # Parent tool names unavailable (mock/test parents) — fall back to
+            # the toolset-derived set so the intersection still applies.
+            import model_tools as _mt
+
+            parent_tool_names = {
+                name
+                for ts in parent_toolsets
+                for name in (_mt.resolve_toolset(ts) if _mt.validate_toolset(ts) else [])
+            }
+            child_allowed_tools = [
+                name for name in child_allowed_tools if name in parent_tool_names
+            ]
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
@@ -2084,6 +2187,7 @@ def _build_child_agent(
                 fallback_model=parent_fallback,
                 enabled_toolsets=child_toolsets,
                 disabled_toolsets=child_disabled_toolsets,
+                allowed_tools=child_allowed_tools,
                 quiet_mode=True,
                 ephemeral_system_prompt=child_prompt,
                 log_prefix=f"[subagent-{task_index}]",

@@ -325,6 +325,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    allowed_tools: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -340,6 +341,14 @@ def get_tool_definitions(
             tool_search / tool_describe bridge handlers so they can read the
             real catalog, not the already-collapsed one. Public callers should
             leave this False.
+        allowed_tools: Exact tool-name allowlist applied as a FINAL subtraction
+            step. ``None`` (the default) means no exact-name boundary — every
+            existing caller is unaffected. A list (INCLUDING AN EMPTY ONE)
+            restricts the result to exactly those tools: anything the toolset
+            expansion, plugin discovery, MCP refresh, or a later dynamic-schema
+            rebuild produces is dropped unless its name is in this list. Used
+            by delegated children to enforce a hard read-only boundary that
+            survives registry/MCP refreshes for the agent's lifetime.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -367,6 +376,7 @@ def get_tool_definitions(
                 registry.current_scope_key(),
                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
                 frozenset(disabled_toolsets) if disabled_toolsets else None,
+                frozenset(allowed_tools) if allowed_tools is not None else None,
                 registry._generation,
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
@@ -386,8 +396,11 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets, disabled_toolsets, quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        allowed_tools=allowed_tools,
+    )
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -419,6 +432,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    allowed_tools: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -696,6 +710,30 @@ def _compute_tool_definitions(
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
+
+    # ── Exact-name allowlist (delegated children) ────────────────────────
+    # FINAL subtraction, deliberately placed after every expansion step so it
+    # bounds the result no matter what earlier stages or future changes add:
+    # toolset resolution, composite bundles, plugin toolsets, MCP tools,
+    # dynamic schema rebuilds, and the tool-search bridge. ``None`` (default)
+    # is a strict no-op for every existing caller; a list — including an
+    # EMPTY one — is a hard exact-name boundary for the agent's lifetime.
+    if allowed_tools is not None:
+        allowed = {str(name) for name in allowed_tools}
+        kept = [
+            t for t in filtered_tools
+            if t.get("function", {}).get("name") in allowed
+        ]
+        if not quiet_mode:
+            dropped_names = [
+                t.get("function", {}).get("name", "?")
+                for t in filtered_tools
+                if t.get("function", {}).get("name") not in allowed
+            ]
+            if dropped_names:
+                print(f"🚫 allowed_tools removed: {', '.join(dropped_names)}")
+        filtered_tools = kept
+        _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
 
     return filtered_tools
 
@@ -1253,6 +1291,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    allowed_tools: Optional[List[str]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1330,6 +1369,7 @@ def handle_function_call(
             current_defs = get_tool_definitions(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                allowed_tools=allowed_tools,
                 quiet_mode=True, skip_tool_search_assembly=True,
             ) or []
         except Exception:
@@ -1392,6 +1432,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                allowed_tools=allowed_tools,
             )
 
     _tool_original_args = dict(function_args)

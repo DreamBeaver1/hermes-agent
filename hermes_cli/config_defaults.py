@@ -2187,6 +2187,23 @@ DEFAULT_CONFIG = {
         # Set to true to restore delivery of child process notifications
         # (with subagent attribution lines).
         "surface_child_process_notifications": False,
+
+        # Exact tool-name ALLOWLIST for delegated children (generic delegation
+        # security). Absent/None (default) = no exact-name boundary; children
+        # keep the existing inherited-toolset behavior. A list — INCLUDING an
+        # empty one — hard-restricts every child's final model-facing tool set
+        # to exactly these names, intersected with (a) the tools the parent
+        # legitimately has and (b) the existing DELEGATE_BLOCKED_TOOLS child
+        # restrictions (blocked tools stay blocked even if listed). The
+        # boundary is enforced at the tool-resolution layer and re-applied on
+        # every registry/MCP/plugin refresh for the child's lifetime, so tools
+        # added by future Hermes updates, plugins, or late MCP connections
+        # stay unavailable unless explicitly listed. Unknown names are dropped
+        # with a logged warning — the allowlist never grants silently.
+        # Example (hard read-only research child):
+        #   allowed_tools: [read_file, search_files, session_search,
+        #                   skill_view, skills_list, web_search, web_extract]
+        "allowed_tools": None,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
